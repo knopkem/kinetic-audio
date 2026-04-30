@@ -1,0 +1,32 @@
+# Rust build output
+/target/
+
+# SQLite training databases
+/data/
+*.db
+*.db-wal
+*.db-shm
+
+# Editor / IDE
+.vscode/
+.idea/
+*.iml
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Environment / secrets
+.env
+.env.*
+
+# Generated / temporary
+*.orig
+*.bak
+flycheck*
+target
+target/flycheck0/stderr
+target/.rustc_info.json
+target/flycheck0/stdout
+target/.rustc_info.json
+

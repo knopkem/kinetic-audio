@@ -1,0 +1,64 @@
+[package]
+name = "kinetic-audio"
+version = "0.1.0"
+edition = "2021"
+authors = ["Your Name <you@example.com>"]
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/your-username/kinetic-audio"
+description = "Cross-platform game audio engine for Rust (native + WASM)"
+keywords = ["audio", "gamedev", "wasm", "web-audio", "spatial-audio"]
+categories = ["game-development", "multimedia::audio"]
+rust-version = "1.70"
+
+[lib]
+crate-type = ["rlib"]
+
+[dependencies]
+slotmap = { version = "1.0", default-features = false }
+web-time = { version = "1.0" }
+log = { version = "0.4" }
+thiserror = { version = "1.0" }
+glam = { version = "0.29" }
+hound = { version = "3.5" }
+
+[dependencies.symphonia]
+version = "0.5"
+optional = true
+
+# === Native-only dependencies ===
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+cpal = { version = "0.15", optional = true }
+
+# === WASM-only dependencies ===
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+wasm-bindgen = { version = "0.2" }
+wasm-bindgen-futures = { version = "0.4" }
+js-sys = { version = "0.3" }
+web-sys = { version = "0.3", features = [
+    "AudioContext","AudioContextOptions","AudioBuffer","AudioBufferOptions","AudioBufferSourceNode",
+    "AudioDestinationNode","AudioListener","AudioNode","AudioParam","GainNode","PannerNode",
+    "DistanceModelType","PanningModelType","BiquadFilterNode"
+] }
+
+[features]
+default = ["cpal-backend"]
+
+# Audio backends
+cpal-backend = ["dep:cpal"]
+web-backend = []
+
+# Decoders
+symphonia = ["dep:symphonia"]
+
+# Spatial audio HRTF tables (large, opt-in)
+hrtf = []
+
+[dev-dependencies]
+criterion = { version = "0.5", default-features = false }
+
+[profile.dev.package."*"]
+opt-level = 3
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
