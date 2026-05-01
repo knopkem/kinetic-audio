@@ -32,10 +32,11 @@ Cross-platform game audio engine for Rust with one API for native desktop (`cpal
 
 ```toml
 [dependencies]
+# Native desktop:
 kinetic-audio = { version = "0.1", features = ["cpal-backend"] }
 
-# Optional extra decoders.
-kinetic-audio = { version = "0.1", features = ["cpal-backend", "symphonia"] }
+# Or with extra decoders:
+# kinetic-audio = { version = "0.1", features = ["cpal-backend", "symphonia"] }
 ```
 
 ```rust
