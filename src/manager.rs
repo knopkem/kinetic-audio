@@ -2,6 +2,7 @@
 //!
 //! This is the only type most users interact with directly.
 
+use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -9,15 +10,35 @@ use slotmap::SlotMap;
 
 #[cfg(target_arch = "wasm32")]
 use crate::backend::web::WebCommandQueue;
-use crate::backend::{Backend, BusId, TrackId, VoiceParam, VoiceSettings};
+use crate::backend::{Backend, BusId, TrackId, VoiceId, VoiceParam, VoiceSettings};
 #[cfg(not(target_arch = "wasm32"))]
 use crate::math::Panning;
-use crate::math::{samples_to_duration, Frame};
+use crate::math::{duration_to_samples, samples_to_duration, Frame};
 use crate::mixer::{Bus, MixSettings};
 use crate::sound::{
     ManagerCommand, PlaybackSettings, SoundData, SoundHandle, SoundKey, WeakHandleBridge,
 };
 use crate::spatial::{Listener, SpatialSettings};
+use crate::sprite::{SpriteData, SpriteKey, SpriteRegion};
+use crate::tween::Tween;
+
+// ── Active Tween ─────────────────────────────────────────────────────────────
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TweenTarget {
+    Volume,
+    Pan,
+}
+
+/// A tween that is currently being driven by `AudioManager::update()`.
+struct ActiveTween {
+    voice: VoiceId,
+    target: TweenTarget,
+    start_val: f32,
+    end_val: f32,
+    tween: Tween,
+    elapsed_secs: f32,
+}
 
 /// Configuration passed to `AudioManager::new()`.
 #[derive(Clone, Debug)]
@@ -46,10 +67,12 @@ impl Default for AudioConfig {
 pub struct AudioManager<B: Backend> {
     backend: B,
     sounds: SlotMap<SoundKey, SoundData>,
+    sprites: SlotMap<SpriteKey, SpriteData>,
     buses: SlotMap<BusId, Bus>,
-    // Master listener.
     listener: Listener,
-    // Command channel (native) or shared queue (WASM).
+    active_tweens: Vec<ActiveTween>,
+    /// Voices that have naturally finished playback (populated by `update()`).
+    finished: HashSet<VoiceId>,
     #[cfg(not(target_arch = "wasm32"))]
     command_rx: std::sync::mpsc::Receiver<ManagerCommand>,
     #[cfg(not(target_arch = "wasm32"))]
@@ -85,8 +108,11 @@ impl<B: Backend> AudioManager<B> {
         let mut manager = Self {
             backend,
             sounds: SlotMap::with_key(),
+            sprites: SlotMap::with_key(),
             buses,
             listener,
+            active_tweens: Vec::new(),
+            finished: HashSet::new(),
             #[cfg(not(target_arch = "wasm32"))]
             command_rx,
             #[cfg(not(target_arch = "wasm32"))]
@@ -102,9 +128,11 @@ impl<B: Backend> AudioManager<B> {
     // Loading
     // -------------------------------------------------------------------
 
-    /// Decode a WAV byte slice and return a handle.
-    pub fn load_sound(&mut self, bytes: &[u8]) -> Result<SoundKey, crate::backend::AudioError> {
-        let (frames, rate) = crate::decode::decode_wav(bytes)
+    /// Decode an audio byte slice and return a key.
+    ///
+    /// `hint` should be the file extension (e.g. `"wav"`, `"ogg"`, `"mp3"`).
+    pub fn load_sound(&mut self, bytes: &[u8], hint: &str) -> Result<SoundKey, crate::backend::AudioError> {
+        let (frames, rate) = crate::decode::decode(bytes, hint)
             .map_err(|e| crate::backend::AudioError::Decode(e.to_string()))?;
         let n_frames = frames.len();
         let samples = Arc::new(frames);
@@ -114,15 +142,84 @@ impl<B: Backend> AudioManager<B> {
             samples,
             sample_rate: rate,
             duration: samples_to_duration(n_frames, rate),
-            channels: 2, // post-decoder always stereo interleaved
+            channels: 2,
         });
         Ok(key)
     }
 
     /// Decode a WAV byte slice as a sprite sheet.
     pub fn load_sprite(&mut self, bytes: &[u8]) -> Result<SoundKey, crate::backend::AudioError> {
-        // For now sprites reuse the same load path — caller defines regions later.
-        self.load_sound(bytes)
+        self.load_sound(bytes, "wav")
+    }
+
+    /// Register named regions over an already-loaded [`SoundKey`].
+    ///
+    /// Returns a [`SpriteKey`] that can be passed to [`play_sprite`](Self::play_sprite).
+    pub fn add_sprite(&mut self, sound: SoundKey, regions: &[SpriteRegion]) -> Result<SpriteKey, crate::backend::AudioError> {
+        let rate = self
+            .sounds
+            .get(sound)
+            .ok_or(crate::backend::AudioError::InvalidHandle)?
+            .sample_rate;
+        let data = SpriteData::from_sound(sound, rate, regions);
+        Ok(self.sprites.insert(data))
+    }
+
+    /// Play a named region from a sprite sheet.
+    ///
+    /// `settings` overrides applied on top of the region's own loop flag.
+    pub fn play_sprite(
+        &mut self,
+        sprite: SpriteKey,
+        region_name: &str,
+        mut settings: PlaybackSettings,
+    ) -> Result<SoundHandle, crate::backend::AudioError> {
+        let sprite_data = self
+            .sprites
+            .get(sprite)
+            .ok_or(crate::backend::AudioError::InvalidHandle)?;
+        let region = sprite_data
+            .region(region_name)
+            .ok_or_else(|| crate::backend::AudioError::Backend(format!("unknown sprite region: {region_name}")))?;
+
+        let start = region.start_sample;
+        let end = region.end_sample;
+        let region_looped = region.looped;
+        let sound_key = sprite_data.sound;
+
+        // Sprite's loop flag takes effect unless the caller explicitly sets looped.
+        settings.looped = settings.looped || region_looped;
+
+        let sound = self
+            .sounds
+            .get(sound_key)
+            .ok_or(crate::backend::AudioError::InvalidHandle)?;
+
+        let spatial = settings.spatial.or_else(|| {
+            settings
+                .position
+                .map(|pos| crate::spatial::SpatialSettings {
+                    position: pos,
+                    ..Default::default()
+                })
+        });
+        let (volume, pan) = self.effective_pan_volume(settings.volume, settings.pan, spatial);
+
+        let voice_settings = VoiceSettings {
+            volume,
+            pan,
+            rate: settings.rate,
+            looped: settings.looped,
+            bus: settings.track.map(|t| self.track_to_bus(t)),
+            spatial,
+            start_sample: Some(start),
+            end_sample: Some(end),
+            delay_samples: duration_to_samples(settings.delay, self.backend.sample_rate()),
+        };
+
+        let voice = self.backend.play(sound.buffer, voice_settings)?;
+        let bridge = self.make_bridge();
+        Ok(SoundHandle { voice, manager: bridge, volume, pan, rate: settings.rate })
     }
 
     /// Upload pre-decoded interleaved stereo samples directly.
@@ -172,6 +269,9 @@ impl<B: Backend> AudioManager<B> {
             looped: settings.looped,
             bus: settings.track.map(|t| self.track_to_bus(t)),
             spatial,
+            start_sample: None,
+            end_sample: None,
+            delay_samples: duration_to_samples(settings.delay, self.backend.sample_rate()),
         };
 
         let voice = self.backend.play(sound.buffer, voice_settings)?;
@@ -223,24 +323,45 @@ impl<B: Backend> AudioManager<B> {
     pub fn add_bus(&mut self, settings: MixSettings) -> Result<BusId, crate::backend::AudioError> {
         let id = self.buses.insert(Bus {
             id: BusId::default(),
-            settings,
+            settings: settings.clone(),
             effects: Vec::new(),
             input: Vec::new(),
         });
         self.buses[id].id = id;
+        self.backend.register_bus(id);
         Ok(id)
     }
 
     /// Remove a bus (voices routed here fall back to master).
     pub fn remove_bus(&mut self, id: BusId) {
         self.buses.remove(id);
+        self.backend.unregister_bus(id);
     }
 
     /// Set per-bus gain in decibels.
     pub fn set_bus_volume_db(&mut self, id: BusId, db: f32) {
+        let gain = crate::math::Decibels::to_linear(db).clamp(0.0, 2.0);
         if let Some(bus) = self.buses.get_mut(id) {
-            bus.settings.gain = crate::math::Decibels::to_linear(db).clamp(0.0, 2.0);
+            bus.settings.gain = gain;
         }
+        let muted = self.buses.get(id).map(|b| b.settings.muted).unwrap_or(false);
+        self.backend.set_bus_config(id, gain, muted);
+    }
+
+    /// Mute or un-mute a bus.
+    pub fn set_bus_muted(&mut self, id: BusId, muted: bool) {
+        if let Some(bus) = self.buses.get_mut(id) {
+            bus.settings.muted = muted;
+        }
+        let gain = self.buses.get(id).map(|b| b.settings.gain).unwrap_or(1.0);
+        self.backend.set_bus_config(id, gain, muted);
+    }
+
+    /// Add a DSP effect to a bus's effect chain.
+    ///
+    /// Effects are applied in insertion order every audio callback frame.
+    pub fn add_bus_effect(&mut self, id: BusId, effect: Box<dyn crate::effects::Effect + Send>) {
+        self.backend.add_bus_effect(id, effect);
     }
 
     // -------------------------------------------------------------------
@@ -249,7 +370,7 @@ impl<B: Backend> AudioManager<B> {
 
     /// Must be called once per frame.
     ///
-    /// * Native: drains command queue, updates tweens.
+    /// * Native: drains command queue, advances tweens.
     /// * WASM:   pushes parameter changes into the JS node graph.
     pub fn update(&mut self, dt: Duration) {
         // Drain command queue.
@@ -266,11 +387,34 @@ impl<B: Backend> AudioManager<B> {
             }
         }
 
-        // Update tweens... (placeholder)
-        let _ = dt;
+        // Advance active tweens.
+        let dt_secs = dt.as_secs_f32();
+        self.active_tweens.retain_mut(|tw| {
+            tw.elapsed_secs += dt_secs;
+            let t = tw.tween.sample(tw.elapsed_secs);
+            let val = tw.start_val + (tw.end_val - tw.start_val) * t;
+            let param = match tw.target {
+                TweenTarget::Volume => VoiceParam::Volume(val),
+                TweenTarget::Pan => VoiceParam::Pan(val),
+            };
+            self.backend.set_param(tw.voice, param);
+            // Keep tween until it has fully reached its end.
+            tw.elapsed_secs < tw.tween.duration.as_secs_f32()
+        });
 
         self.backend.tick(dt);
-        let _ = self.backend.finished_voices();
+        for id in self.backend.finished_voices() {
+            self.finished.insert(id);
+        }
+    }
+
+    /// Returns `true` if the voice for this handle has naturally ended.
+    ///
+    /// The finished state is retained until the handle is dropped or
+    /// [`AudioManager::update`] is called and the entry is evicted, so
+    /// short-lived callers that only check once per frame will not miss it.
+    pub fn is_finished(&self, handle: &crate::sound::SoundHandle) -> bool {
+        self.finished.contains(&handle.voice)
     }
 
     /// Ask the backend to resume playback if it is lifecycle-gated.
@@ -357,9 +501,14 @@ impl<B: Backend> AudioManager<B> {
         match cmd {
             SetVolume(voice, vol) => {
                 self.backend.set_param(voice, VoiceParam::Volume(vol));
+                // Cancel any in-flight volume tween for this voice.
+                self.active_tweens
+                    .retain(|tw| !(tw.voice == voice && tw.target == TweenTarget::Volume));
             }
             SetPan(voice, pan) => {
                 self.backend.set_param(voice, VoiceParam::Pan(pan));
+                self.active_tweens
+                    .retain(|tw| !(tw.voice == voice && tw.target == TweenTarget::Pan));
             }
             SetRate(voice, rate) => {
                 self.backend.set_param(voice, VoiceParam::Rate(rate));
@@ -369,15 +518,66 @@ impl<B: Backend> AudioManager<B> {
                     self.backend.set_param(voice, VoiceParam::Position(pos));
                 }
             }
-            FadeVolume(voice, target, _) => {
-                // TODO: tween system
-                self.backend.set_param(voice, VoiceParam::Volume(target));
+            FadeVolume(voice, target, tween) => {
+                if tween.duration.is_zero() {
+                    self.backend.set_param(voice, VoiceParam::Volume(target));
+                    self.active_tweens
+                        .retain(|tw| !(tw.voice == voice && tw.target == TweenTarget::Volume));
+                } else {
+                    // Use the last known value as the start (0.0 is a safe fallback).
+                    let start_val = self
+                        .active_tweens
+                        .iter()
+                        .rfind(|tw| tw.voice == voice && tw.target == TweenTarget::Volume)
+                        .map(|tw| tw.start_val + (tw.end_val - tw.start_val) * tw.tween.sample(tw.elapsed_secs))
+                        .unwrap_or(0.0);
+                    self.active_tweens
+                        .retain(|tw| !(tw.voice == voice && tw.target == TweenTarget::Volume));
+                    self.active_tweens.push(ActiveTween {
+                        voice,
+                        target: TweenTarget::Volume,
+                        start_val,
+                        end_val: target,
+                        tween,
+                        elapsed_secs: 0.0,
+                    });
+                }
             }
-            FadePan(voice, target, _) => {
-                self.backend.set_param(voice, VoiceParam::Pan(target));
+            FadePan(voice, target, tween) => {
+                if tween.duration.is_zero() {
+                    self.backend.set_param(voice, VoiceParam::Pan(target));
+                    self.active_tweens
+                        .retain(|tw| !(tw.voice == voice && tw.target == TweenTarget::Pan));
+                } else {
+                    let start_val = self
+                        .active_tweens
+                        .iter()
+                        .rfind(|tw| tw.voice == voice && tw.target == TweenTarget::Pan)
+                        .map(|tw| tw.start_val + (tw.end_val - tw.start_val) * tw.tween.sample(tw.elapsed_secs))
+                        .unwrap_or(0.0);
+                    self.active_tweens
+                        .retain(|tw| !(tw.voice == voice && tw.target == TweenTarget::Pan));
+                    self.active_tweens.push(ActiveTween {
+                        voice,
+                        target: TweenTarget::Pan,
+                        start_val,
+                        end_val: target,
+                        tween,
+                        elapsed_secs: 0.0,
+                    });
+                }
             }
             Stop(voice) => {
+                // Cancel any tweens targeting this voice.
+                self.active_tweens.retain(|tw| tw.voice != voice);
                 self.backend.stop_voice(voice);
+            }
+            StopAfterLoop(voice) => {
+                self.backend.set_param(voice, VoiceParam::StopAfterLoop);
+            }
+            FadeOut(voice, dur) => {
+                self.active_tweens.retain(|tw| tw.voice != voice);
+                self.backend.set_param(voice, VoiceParam::FadeOut(dur));
             }
         }
     }

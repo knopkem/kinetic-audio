@@ -93,7 +93,11 @@ impl Backend for NullBackend {
                 VoiceParam::Rate(r) => v.settings.rate = *r,
                 VoiceParam::Position(_) => {}
                 VoiceParam::StopAfterLoop => {}
-                VoiceParam::FadeOut(_) => {}
+                VoiceParam::FadeOut(_) => {
+                    // Simulate fade-out completing instantly in the null backend.
+                    v.active = false;
+                    v.finished = true;
+                }
             }
         }
         self.log

@@ -1,11 +1,7 @@
 //! Mixer: tracks, busses, and routing.
 
-use std::sync::Arc;
-
-use slotmap::SlotMap;
-
 use crate::effects::Effect;
-use crate::math::{Decibels, Frame};
+use crate::math::Frame;
 
 /// Opaque handle to a mixer bus.
 pub type BusHandle = slotmap::DefaultKey;

@@ -24,6 +24,8 @@ hound = { version = "3.5" }
 [dependencies.symphonia]
 version = "0.5"
 optional = true
+default-features = false
+features = ["ogg", "vorbis", "mp3", "flac", "wav", "aac", "isomp4"]
 
 # === Native-only dependencies ===
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]

@@ -128,6 +128,8 @@ pub(crate) enum ManagerCommand {
     SetPosition(VoiceId, Option<Vec3>),
     FadeVolume(VoiceId, f32, Tween),
     FadePan(VoiceId, f32, Tween),
+    StopAfterLoop(VoiceId),
+    FadeOut(VoiceId, Duration),
     Stop(VoiceId),
 }
 
@@ -181,6 +183,16 @@ impl SoundHandle {
     /// Clear the 3D position (reverts to 2D pan).
     pub fn clear_position(&mut self) {
         self.send_cmd(ManagerCommand::SetPosition(self.voice, None));
+    }
+
+    /// Stop after the current loop completes (no-op for non-looping sounds).
+    pub fn stop_after_loop(&self) {
+        self.send_cmd(ManagerCommand::StopAfterLoop(self.voice));
+    }
+
+    /// Fade out over `duration` then stop.
+    pub fn fade_out(&self, duration: Duration) {
+        self.send_cmd(ManagerCommand::FadeOut(self.voice, duration));
     }
 
     #[inline]

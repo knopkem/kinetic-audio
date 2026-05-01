@@ -3,13 +3,10 @@
 //! A sprite sheet for audio — useful for packing many short SFX into one
 //! file and reducing HTTP requests in WASM builds.
 
-use std::sync::Arc;
 use std::time::Duration;
 
-use slotmap::SlotMap;
-
-use crate::math::{duration_to_samples, Frame};
-use crate::sound::{PlaybackSettings, SoundData, SoundKey};
+use crate::math::duration_to_samples;
+use crate::sound::{PlaybackSettings, SoundKey};
 
 /// Opaque key referencing a loaded sprite.
 pub type SpriteKey = slotmap::DefaultKey;

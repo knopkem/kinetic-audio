@@ -1,11 +1,16 @@
 //! Audio format decoders.
 //!
 //! Currently supports WAV via `hound`.
-//! OGG / MP3 / FLAC via symphonia are behind the `"symphonia"` feature flag.
+//! OGG Vorbis, MP3, FLAC, and more are available via the `"symphonia"` feature flag.
 
 pub mod wav;
 
+#[cfg(feature = "symphonia")]
+pub mod symphonia;
+
 pub use self::wav::decode_wav;
+#[cfg(feature = "symphonia")]
+pub use self::symphonia::decode_symphonia;
 
 /// Generic decode error.
 #[derive(Debug, thiserror::Error)]
@@ -26,13 +31,24 @@ pub enum DecodeError {
 
 /// Decode any supported format from a byte slice.
 ///
-/// Returns `(interleaved stereo f32 frames, sample_rate)`.
-pub fn decode(bytes: &[u8], _hint: &str) -> Result<(Vec<crate::math::Frame>, u32), DecodeError> {
-    if _hint.ends_with("wav") || _hint.ends_with("wave") {
+/// `hint` should be the file extension (e.g. `"wav"`, `"ogg"`, `"mp3"`).
+/// When the `"symphonia"` feature is enabled, all formats symphonia
+/// supports are tried automatically for non-WAV extensions.
+pub fn decode(bytes: &[u8], hint: &str) -> Result<(Vec<crate::math::Frame>, u32), DecodeError> {
+    let ext = hint.trim_start_matches('.');
+
+    if ext.eq_ignore_ascii_case("wav") || ext.eq_ignore_ascii_case("wave") {
         return decode_wav(bytes);
     }
 
-    Err(DecodeError::Unsupported(
-        "no decoder available for this format".into(),
-    ))
+    #[cfg(feature = "symphonia")]
+    {
+        return decode_symphonia(bytes);
+    }
+
+    #[cfg(not(feature = "symphonia"))]
+    Err(DecodeError::Unsupported(format!(
+        "no decoder available for '{}' — enable the \"symphonia\" feature for OGG/MP3/FLAC",
+        ext
+    )))
 }

@@ -19,7 +19,6 @@ use std::time::Duration;
 
 use crate::math::Frame;
 use crate::spatial::{Listener, SpatialSettings, Vec3};
-use crate::tween::Tween;
 
 /// Opaque handle for a decoded buffer that has been uploaded to a backend.
 pub type BufferHandle = slotmap::DefaultKey;
@@ -65,6 +64,12 @@ pub struct VoiceSettings {
     pub bus: Option<BusId>,
     /// 3D spatial configuration (backend may ignore if unsupported).
     pub spatial: Option<SpatialSettings>,
+    /// First sample frame to play (inclusive). `None` means 0.
+    pub start_sample: Option<usize>,
+    /// Last sample frame to play (exclusive). `None` means end-of-buffer.
+    pub end_sample: Option<usize>,
+    /// Silence to render before playback begins (in sample frames).
+    pub delay_samples: usize,
 }
 
 impl Default for VoiceSettings {
@@ -76,6 +81,9 @@ impl Default for VoiceSettings {
             looped: false,
             bus: None,
             spatial: None,
+            start_sample: None,
+            end_sample: None,
+            delay_samples: 0,
         }
     }
 }
@@ -147,6 +155,20 @@ pub trait Backend {
 
     /// Current output sample rate.
     fn sample_rate(&self) -> u32;
+
+    // ── Bus management (optional — default no-ops for WASM / Null) ──────────
+
+    /// Register a new mixer bus so the backend can route voices to it.
+    fn register_bus(&mut self, _id: BusId) {}
+
+    /// Unregister a bus.
+    fn unregister_bus(&mut self, _id: BusId) {}
+
+    /// Update bus gain and mute state.
+    fn set_bus_config(&mut self, _id: BusId, _gain: f32, _muted: bool) {}
+
+    /// Append a DSP effect to a bus's effect chain.
+    fn add_bus_effect(&mut self, _id: BusId, _effect: Box<dyn crate::effects::Effect + Send>) {}
 }
 
 // ── Errors ──────────────────────────────────────────────────────────────────

@@ -2,31 +2,46 @@
 //!
 //! Mixer runs inside the real-time cpal callback.  The main thread
 //! communicates with the callback via a bounded `std::sync::mpsc`.
+//! Bus effect chains are shared via `Arc<Mutex<>>` (main thread adds/removes
+//! effects; audio thread `try_lock()`s to apply them without blocking).
 
 use std::collections::HashMap;
 use std::sync::mpsc::{sync_channel, Receiver, SyncSender};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use slotmap::SlotMap;
 
 use crate::backend::{
-    AudioError, Backend, BufferHandle, DeviceConfig, VoiceId, VoiceParam, VoiceSettings,
+    AudioError, Backend, BusId, BufferHandle, DeviceConfig, VoiceId, VoiceParam, VoiceSettings,
 };
+use crate::effects::Effect;
 use crate::math::{Frame, Panning};
+// Listener is used via the Backend trait's set_listener default.
 
 const MAX_VOICES: usize = 256;
 const COMMAND_QUEUE_CAP: usize = 512;
 
-/// cpal-based native backend.
-pub struct CpalBackend {
-    sample_rate: u32,
-    buffers: SlotMap<BufferHandle, Arc<Vec<Frame>>>,
-    voice_ids: SlotMap<VoiceId, ()>,
-    command_tx: SyncSender<AudioCommand>,
-    finished_rx: Receiver<VoiceId>,
-    _stream: cpal::Stream,
+// ── Shared bus effect chain ──────────────────────────────────────────────────
+
+/// Per-bus state visible to both the main thread and the audio callback.
+pub struct BusState {
+    pub gain: f32,
+    pub muted: bool,
+    /// Effect chain processed in the audio callback.
+    pub effects: Vec<Box<dyn Effect + Send>>,
 }
+
+impl BusState {
+    fn new(gain: f32) -> Self {
+        Self { gain, muted: false, effects: Vec::new() }
+    }
+}
+
+/// Thread-safe handle to a bus's shared state.
+pub type SharedBus = Arc<Mutex<BusState>>;
+
+// ── Commands ─────────────────────────────────────────────────────────────────
 
 #[derive(Clone)]
 enum AudioCommand {
@@ -42,16 +57,90 @@ enum AudioCommand {
     Stop {
         id: VoiceId,
     },
+    /// Register a new bus (or re-register after recreation).
+    AddBus {
+        id: BusId,
+        bus: SharedBus,
+    },
+    /// Unregister a bus (voices routed to it fall back to master).
+    RemoveBus {
+        id: BusId,
+    },
 }
+
+// ── Voice ─────────────────────────────────────────────────────────────────────
 
 struct Voice {
     buffer: Arc<Vec<Frame>>,
+    /// Current read position (fractional sample index).
     cursor: f64,
+    /// Effective start of the playback region.
+    start_sample: usize,
+    /// Effective end of the playback region.
+    end_sample: usize,
     volume: f32,
     pan: f32,
     rate: f32,
     looped: bool,
+    stop_after_loop: bool,
+    delay_remaining: usize,
+    /// Fade-out state: `Some((total_samples, elapsed_samples))`.
+    fade_out: Option<(usize, usize)>,
+    /// Target bus (None = master).
+    bus: Option<BusId>,
     active: bool,
+}
+
+// ── Backend ──────────────────────────────────────────────────────────────────
+
+/// cpal-based native backend.
+pub struct CpalBackend {
+    sample_rate: u32,
+    buffers: SlotMap<BufferHandle, Arc<Vec<Frame>>>,
+    voice_ids: SlotMap<VoiceId, ()>,
+    /// Shared bus states; also held by the audio callback.
+    buses: HashMap<BusId, SharedBus>,
+    command_tx: SyncSender<AudioCommand>,
+    finished_rx: Receiver<VoiceId>,
+    _stream: cpal::Stream,
+}
+
+impl CpalBackend {
+    /// Add an effect to a bus's effect chain (main thread).
+    pub fn add_bus_effect(&self, bus: BusId, effect: Box<dyn Effect + Send>) {
+        if let Some(shared) = self.buses.get(&bus) {
+            if let Ok(mut state) = shared.lock() {
+                state.effects.push(effect);
+            }
+        }
+    }
+
+    /// Update bus gain and mute state (main thread).
+    pub fn set_bus_config(&self, bus: BusId, gain: f32, muted: bool) {
+        if let Some(shared) = self.buses.get(&bus) {
+            if let Ok(mut state) = shared.lock() {
+                state.gain = gain;
+                state.muted = muted;
+            }
+        }
+    }
+
+    /// Register a new bus and share it with the audio callback.
+    pub fn register_bus(&mut self, id: BusId) -> SharedBus {
+        let shared = Arc::new(Mutex::new(BusState::new(1.0)));
+        self.buses.insert(id, shared.clone());
+        let _ = self.command_tx.try_send(AudioCommand::AddBus {
+            id,
+            bus: shared.clone(),
+        });
+        shared
+    }
+
+    /// Remove a bus.
+    pub fn unregister_bus(&mut self, id: BusId) {
+        self.buses.remove(&id);
+        let _ = self.command_tx.try_send(AudioCommand::RemoveBus { id });
+    }
 }
 
 impl Backend for CpalBackend {
@@ -79,10 +168,8 @@ impl Backend for CpalBackend {
             .clone();
 
         let sample_rate = if _config.sample_rate == 0 {
-            // Let cpal pick its preferred rate (usually 44.1 kHz or 48 kHz).
             range.min_sample_rate().0
         } else {
-            // Clamp user request to what the device actually supports.
             _config
                 .sample_rate
                 .clamp(range.min_sample_rate().0, range.max_sample_rate().0)
@@ -104,30 +191,37 @@ impl Backend for CpalBackend {
                 &stream_config,
                 {
                     let mut voices: HashMap<VoiceId, Voice> = HashMap::with_capacity(MAX_VOICES);
+                    /// Per-bus accumulator buffers: bus_id -> (SharedBus, samples).
+                    let mut bus_buffers: HashMap<BusId, (SharedBus, Vec<Frame>)> = HashMap::new();
                     let mut rx = rx;
                     let finished_tx = finished_tx;
+                    let sample_rate = actual_rate;
                     move |data: &mut [f32], _: &cpal::OutputCallbackInfo| {
+                        let frames = data.len() / channels.max(1);
+
                         // Drain commands.
                         while let Ok(cmd) = rx.try_recv() {
                             match cmd {
-                                AudioCommand::Play {
-                                    id,
-                                    buffer,
-                                    settings,
-                                } => {
+                                AudioCommand::Play { id, buffer, settings } => {
                                     if voices.len() < MAX_VOICES {
-                                        voices.insert(
-                                            id,
-                                            Voice {
-                                                buffer,
-                                                cursor: 0.0,
-                                                volume: settings.volume,
-                                                pan: settings.pan,
-                                                rate: settings.rate,
-                                                looped: settings.looped,
-                                                active: true,
-                                            },
-                                        );
+                                        let buf_len = buffer.len();
+                                        let start = settings.start_sample.unwrap_or(0).min(buf_len);
+                                        let end = settings.end_sample.unwrap_or(buf_len).min(buf_len);
+                                        voices.insert(id, Voice {
+                                            cursor: start as f64,
+                                            start_sample: start,
+                                            end_sample: end,
+                                            buffer,
+                                            volume: settings.volume,
+                                            pan: settings.pan,
+                                            rate: settings.rate,
+                                            looped: settings.looped,
+                                            stop_after_loop: false,
+                                            delay_remaining: settings.delay_samples,
+                                            fade_out: None,
+                                            bus: settings.bus,
+                                            active: true,
+                                        });
                                     }
                                 }
                                 AudioCommand::SetParam { id, param } => {
@@ -136,43 +230,113 @@ impl Backend for CpalBackend {
                                             VoiceParam::Volume(x) => v.volume = x,
                                             VoiceParam::Pan(x) => v.pan = x,
                                             VoiceParam::Rate(x) => v.rate = x,
-                                            VoiceParam::StopAfterLoop => {}
-                                            VoiceParam::FadeOut(_) => {}
+                                            VoiceParam::StopAfterLoop => v.stop_after_loop = true,
+                                            VoiceParam::FadeOut(dur) => {
+                                                let total = (dur.as_secs_f32() * sample_rate as f32) as usize;
+                                                v.fade_out = Some((total.max(1), 0));
+                                            }
                                             VoiceParam::Position(_) => {}
                                         }
                                     }
                                 }
-                                AudioCommand::Stop { id } => {
-                                    voices.remove(&id);
+                                AudioCommand::Stop { id } => { voices.remove(&id); }
+                                AudioCommand::AddBus { id, bus } => {
+                                    bus_buffers.insert(id, (bus, vec![Frame::SILENCE; frames]));
                                 }
+                                AudioCommand::RemoveBus { id } => { bus_buffers.remove(&id); }
                             }
                         }
 
-                        // Render.
-                        let frames = data.len() / channels.max(1);
-                        for i in 0..frames {
-                            let mut acc = Frame::SILENCE;
-                            for (id, v) in voices.iter_mut() {
-                                if !v.active {
+                        // Resize bus buffers if the callback frame size changed.
+                        for (_, (_, buf)) in bus_buffers.iter_mut() {
+                            if buf.len() != frames {
+                                buf.resize(frames, Frame::SILENCE);
+                            }
+                        }
+
+                        // Clear accumulation buffers.
+                        let mut master_buf = vec![Frame::SILENCE; frames];
+                        for (_, (_, buf)) in bus_buffers.iter_mut() {
+                            for f in buf.iter_mut() { *f = Frame::SILENCE; }
+                        }
+
+                        // Mix voices into their respective bus (or master).
+                        for (id, v) in voices.iter_mut() {
+                            if !v.active { continue; }
+
+                            // Render this voice into a temporary per-voice buffer.
+                            let dest: &mut Vec<Frame> = if let Some(bus_id) = v.bus {
+                                if let Some((_, buf)) = bus_buffers.get_mut(&bus_id) {
+                                    buf
+                                } else {
+                                    &mut master_buf
+                                }
+                            } else {
+                                &mut master_buf
+                            };
+
+                            for frame_idx in 0..frames {
+                                if v.delay_remaining > 0 {
+                                    v.delay_remaining -= 1;
                                     continue;
                                 }
                                 let idx = v.cursor as usize;
-                                if idx >= v.buffer.len() {
-                                    if v.looped {
-                                        v.cursor -= v.buffer.len() as f64;
+                                if idx >= v.end_sample {
+                                    if v.looped && !v.stop_after_loop {
+                                        v.cursor = v.start_sample as f64 + (v.cursor - v.end_sample as f64);
                                     } else {
                                         v.active = false;
                                         let _ = finished_tx.try_send(*id);
-                                        continue;
+                                        break;
                                     }
                                 }
                                 let s = v.buffer[v.cursor as usize];
                                 let (lg, rg) = Panning::constant_power(v.pan);
-                                acc.l += s.l * lg * v.volume;
-                                acc.r += s.r * rg * v.volume;
+                                let fade_gain = if let Some((total, elapsed)) = v.fade_out {
+                                    let g = 1.0 - (elapsed as f32 / total as f32);
+                                    v.fade_out = if elapsed + 1 >= total {
+                                        v.active = false;
+                                        let _ = finished_tx.try_send(*id);
+                                        None
+                                    } else {
+                                        Some((total, elapsed + 1))
+                                    };
+                                    g.max(0.0)
+                                } else {
+                                    1.0
+                                };
+                                dest[frame_idx].l += s.l * lg * v.volume * fade_gain;
+                                dest[frame_idx].r += s.r * rg * v.volume * fade_gain;
                                 v.cursor += v.rate as f64;
                             }
-                            acc = acc.clamp();
+                        }
+                        voices.retain(|_, v| v.active);
+
+                        // Apply bus effects and mix buses into master.
+                        for (_, (shared_bus, bus_buf)) in bus_buffers.iter_mut() {
+                            if let Ok(mut state) = shared_bus.try_lock() {
+                                if state.muted {
+                                    for f in bus_buf.iter_mut() { *f = Frame::SILENCE; }
+                                } else {
+                                    // Apply per-bus gain.
+                                    let g = state.gain;
+                                    for f in bus_buf.iter_mut() { *f = f.scale(g); }
+                                    // Run effect chain.
+                                    for fx in state.effects.iter_mut() {
+                                        fx.process(bus_buf, sample_rate);
+                                    }
+                                }
+                            }
+                            // Mix bus output into master.
+                            for (i, f) in bus_buf.iter().enumerate() {
+                                master_buf[i].l += f.l;
+                                master_buf[i].r += f.r;
+                            }
+                        }
+
+                        // Write clamped master to output.
+                        for i in 0..frames {
+                            let acc = master_buf[i].clamp();
                             if channels >= 2 {
                                 data[i * channels] = acc.l;
                                 data[i * channels + 1] = acc.r;
@@ -183,7 +347,6 @@ impl Backend for CpalBackend {
                                 data[i * channels + c] = 0.0;
                             }
                         }
-                        voices.retain(|_, v| v.active);
                     }
                 },
                 err_fn,
@@ -199,6 +362,7 @@ impl Backend for CpalBackend {
             sample_rate: actual_rate,
             buffers: SlotMap::with_key(),
             voice_ids: SlotMap::with_key(),
+            buses: HashMap::new(),
             command_tx: tx,
             finished_rx,
             _stream: stream,
@@ -211,34 +375,17 @@ impl Backend for CpalBackend {
         self.buffers.insert(samples)
     }
 
-    fn play(
-        &mut self,
-        buffer: BufferHandle,
-        settings: VoiceSettings,
-    ) -> Result<VoiceId, AudioError> {
-        let buf = self
-            .buffers
-            .get(buffer)
-            .cloned()
-            .ok_or(AudioError::InvalidHandle)?;
-
+    fn play(&mut self, buffer: BufferHandle, settings: VoiceSettings) -> Result<VoiceId, AudioError> {
+        let buf = self.buffers.get(buffer).cloned().ok_or(AudioError::InvalidHandle)?;
         let id = self.voice_ids.insert(());
-
         self.command_tx
-            .try_send(AudioCommand::Play {
-                id,
-                buffer: buf,
-                settings,
-            })
+            .try_send(AudioCommand::Play { id, buffer: buf, settings })
             .map_err(|_| AudioError::VoiceLimit)?;
-
         Ok(id)
     }
 
     fn set_param(&mut self, voice: VoiceId, param: VoiceParam) {
-        let _ = self
-            .command_tx
-            .try_send(AudioCommand::SetParam { id: voice, param });
+        let _ = self.command_tx.try_send(AudioCommand::SetParam { id: voice, param });
     }
 
     fn stop_voice(&mut self, voice: VoiceId) {
@@ -257,5 +404,21 @@ impl Backend for CpalBackend {
 
     fn sample_rate(&self) -> u32 {
         self.sample_rate
+    }
+
+    fn register_bus(&mut self, id: BusId) {
+        CpalBackend::register_bus(self, id);
+    }
+
+    fn unregister_bus(&mut self, id: BusId) {
+        CpalBackend::unregister_bus(self, id);
+    }
+
+    fn set_bus_config(&mut self, id: BusId, gain: f32, muted: bool) {
+        CpalBackend::set_bus_config(self, id, gain, muted);
+    }
+
+    fn add_bus_effect(&mut self, id: BusId, effect: Box<dyn crate::effects::Effect + Send>) {
+        CpalBackend::add_bus_effect(self, id, effect);
     }
 }
