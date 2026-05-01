@@ -131,6 +131,10 @@ pub(crate) enum ManagerCommand {
     SetPan(VoiceId, f32),
     SetRate(VoiceId, f32),
     SetPosition(VoiceId, Option<Vec3>),
+    Pause(VoiceId),
+    Resume(VoiceId),
+    SeekTo(VoiceId, Duration),
+    SeekBy(VoiceId, f64),
     FadeVolume(VoiceId, f32, Tween),
     FadePan(VoiceId, f32, Tween),
     StopAfterLoop(VoiceId),
@@ -183,6 +187,28 @@ impl SoundHandle {
     pub fn set_rate(&mut self, rate: f32) {
         self.rate = rate.clamp(0.1, 4.0);
         self.send_cmd(ManagerCommand::SetRate(self.voice, self.rate));
+    }
+
+    /// Pause playback while keeping the current position.
+    pub fn pause(&self) {
+        self.send_cmd(ManagerCommand::Pause(self.voice));
+    }
+
+    /// Resume a paused voice.
+    pub fn resume(&self) {
+        self.send_cmd(ManagerCommand::Resume(self.voice));
+    }
+
+    /// Seek to an absolute position within the current sound or sprite region.
+    pub fn seek_to(&self, position: Duration) {
+        self.send_cmd(ManagerCommand::SeekTo(self.voice, position));
+    }
+
+    /// Seek relative to the current position.
+    ///
+    /// Positive values move forward; negative values move backward.
+    pub fn seek_by_seconds(&self, delta_seconds: f64) {
+        self.send_cmd(ManagerCommand::SeekBy(self.voice, delta_seconds));
     }
 
     /// Move the sound in 3D space.

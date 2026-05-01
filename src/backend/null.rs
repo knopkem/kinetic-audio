@@ -34,8 +34,12 @@ pub struct NullVoice {
     pub buffer: BufferHandle,
     /// Last-known voice settings.
     pub settings: VoiceSettings,
+    /// Current playback offset within the region, in source sample frames.
+    pub position_samples: usize,
     /// Whether the voice is still active.
     pub active: bool,
+    /// Whether the voice is paused.
+    pub paused: bool,
     /// Whether the voice should be reported as finished.
     pub finished: bool,
 }
@@ -103,7 +107,9 @@ impl Backend for NullBackend {
         let id = self.voices.insert(NullVoice {
             buffer,
             settings,
+            position_samples: 0,
             active: true,
+            paused: false,
             finished: false,
         });
         self.log.push(BackendLog::Play(buffer));
@@ -116,6 +122,9 @@ impl Backend for NullBackend {
                 VoiceParam::Volume(g) => v.settings.volume = *g,
                 VoiceParam::Pan(p) => v.settings.pan = *p,
                 VoiceParam::Rate(r) => v.settings.rate = *r,
+                VoiceParam::Pause => v.paused = true,
+                VoiceParam::Resume => v.paused = false,
+                VoiceParam::Seek(offset) => v.position_samples = *offset,
                 VoiceParam::Position(_) => {}
                 VoiceParam::StopAfterLoop => {}
                 VoiceParam::FadeOut(_) => {

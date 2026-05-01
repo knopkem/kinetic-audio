@@ -68,6 +68,50 @@ fn stop_voice_immediately() {
     m.update(Duration::from_millis(16));
 }
 
+#[test]
+fn pause_resume_and_position_tracking_work() {
+    let bytes = make_wav(10_000);
+    let mut m = null_manager();
+    let key = m.load_sound(&bytes, "wav").expect("load failed");
+    let handle = m.play(key, PlaybackSettings::default()).expect("play failed");
+
+    m.update(Duration::from_millis(100));
+    let before_pause = m.playback_position(&handle).expect("position missing");
+    assert!(before_pause >= Duration::from_millis(95));
+
+    handle.pause();
+    m.update(Duration::from_millis(50));
+    let paused_position = m.playback_position(&handle).expect("position missing");
+    assert_eq!(paused_position, before_pause);
+    assert!(m.is_paused(&handle));
+
+    handle.resume();
+    m.update(Duration::from_millis(50));
+    let after_resume = m.playback_position(&handle).expect("position missing");
+    assert!(after_resume > paused_position);
+    assert!(!m.is_paused(&handle));
+}
+
+#[test]
+fn seek_controls_position() {
+    let bytes = make_wav(10_000);
+    let mut m = null_manager();
+    let key = m.load_sound(&bytes, "wav").expect("load failed");
+    let handle = m.play(key, PlaybackSettings::default()).expect("play failed");
+
+    handle.seek_to(Duration::from_millis(150));
+    m.update(Duration::ZERO);
+    let pos = m.playback_position(&handle).expect("position missing");
+    assert!(pos >= Duration::from_millis(149));
+    assert!(pos <= Duration::from_millis(151));
+
+    handle.seek_by_seconds(-0.05);
+    m.update(Duration::ZERO);
+    let pos = m.playback_position(&handle).expect("position missing");
+    assert!(pos >= Duration::from_millis(99));
+    assert!(pos <= Duration::from_millis(101));
+}
+
 // ── tween interpolation ───────────────────────────────────────────────────────
 
 #[test]

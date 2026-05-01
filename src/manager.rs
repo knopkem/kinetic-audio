@@ -43,6 +43,13 @@ struct ActiveTween {
 struct ManagedVoiceState {
     base_volume: f32,
     base_pan: f32,
+    sample_rate: u32,
+    region_len_samples: usize,
+    position_samples: f64,
+    rate: f32,
+    looped: bool,
+    paused: bool,
+    delay_remaining_secs: f64,
     spatial: Option<SpatialSettings>,
     spatialized_once: bool,
 }
@@ -230,6 +237,13 @@ impl<B: Backend> AudioManager<B> {
             ManagedVoiceState {
                 base_volume: settings.volume,
                 base_pan: settings.pan,
+                sample_rate: sound.sample_rate,
+                region_len_samples: end.saturating_sub(start),
+                position_samples: 0.0,
+                rate: settings.rate,
+                looped: settings.looped,
+                paused: false,
+                delay_remaining_secs: settings.delay.as_secs_f64(),
                 spatial,
                 spatialized_once: spatial.is_some(),
             },
@@ -296,6 +310,13 @@ impl<B: Backend> AudioManager<B> {
             ManagedVoiceState {
                 base_volume: settings.volume,
                 base_pan: settings.pan,
+                sample_rate: sound.sample_rate,
+                region_len_samples: sound.samples.len(),
+                position_samples: 0.0,
+                rate: settings.rate,
+                looped: settings.looped,
+                paused: false,
+                delay_remaining_secs: settings.delay.as_secs_f64(),
                 spatial,
                 spatialized_once: spatial.is_some(),
             },
@@ -419,6 +440,31 @@ impl<B: Backend> AudioManager<B> {
             }
         }
 
+        let dt_secs_f64 = dt.as_secs_f64();
+        for state in self.voice_states.values_mut() {
+            if state.paused {
+                continue;
+            }
+
+            let mut remaining_dt = dt_secs_f64;
+            if state.delay_remaining_secs > 0.0 {
+                if remaining_dt <= state.delay_remaining_secs {
+                    state.delay_remaining_secs -= remaining_dt;
+                    continue;
+                }
+                remaining_dt -= state.delay_remaining_secs;
+                state.delay_remaining_secs = 0.0;
+            }
+
+            state.position_samples += remaining_dt * state.sample_rate as f64 * state.rate as f64;
+            let region_len = state.region_len_samples as f64;
+            if state.looped && region_len > 0.0 {
+                state.position_samples %= region_len;
+            } else if region_len > 0.0 {
+                state.position_samples = state.position_samples.min(region_len);
+            }
+        }
+
         // Advance active tweens.
         let dt_secs = dt.as_secs_f32();
         let mut active_tweens = std::mem::take(&mut self.active_tweens);
@@ -461,6 +507,22 @@ impl<B: Backend> AudioManager<B> {
     /// short-lived callers that only check once per frame will not miss it.
     pub fn is_finished(&self, handle: &crate::sound::SoundHandle) -> bool {
         self.finished.contains(&handle.voice)
+    }
+
+    /// Returns the current playback position within the sound or sprite region.
+    pub fn playback_position(&self, handle: &crate::sound::SoundHandle) -> Option<Duration> {
+        self.voice_states.get(&handle.voice).map(|state| {
+            let secs = (state.position_samples / state.sample_rate as f64).max(0.0);
+            Duration::from_secs_f64(secs)
+        })
+    }
+
+    /// Returns whether the voice is currently paused.
+    pub fn is_paused(&self, handle: &crate::sound::SoundHandle) -> bool {
+        self.voice_states
+            .get(&handle.voice)
+            .map(|state| state.paused)
+            .unwrap_or(false)
     }
 
     /// Ask the backend to resume playback if it is lifecycle-gated.
@@ -613,6 +675,9 @@ impl<B: Backend> AudioManager<B> {
                     .retain(|tw| !(tw.voice == voice && tw.target == TweenTarget::Pan));
             }
             SetRate(voice, rate) => {
+                if let Some(state) = self.voice_states.get_mut(&voice) {
+                    state.rate = rate;
+                }
                 self.backend.set_param(voice, VoiceParam::Rate(rate));
             }
             SetPosition(voice, maybe_pos) => {
@@ -692,6 +757,52 @@ impl<B: Backend> AudioManager<B> {
                         tween,
                         elapsed_secs: 0.0,
                     });
+                }
+            }
+            Pause(voice) => {
+                if let Some(state) = self.voice_states.get_mut(&voice) {
+                    state.paused = true;
+                }
+                self.backend.set_param(voice, VoiceParam::Pause);
+            }
+            Resume(voice) => {
+                if let Some(state) = self.voice_states.get_mut(&voice) {
+                    state.paused = false;
+                }
+                self.backend.set_param(voice, VoiceParam::Resume);
+            }
+            SeekTo(voice, position) => {
+                if let Some(state) = self.voice_states.get_mut(&voice) {
+                    state.delay_remaining_secs = 0.0;
+                    let target = duration_to_samples(position, state.sample_rate) as f64;
+                    let max = state.region_len_samples as f64;
+                    state.position_samples = if state.looped && max > 0.0 {
+                        target % max
+                    } else {
+                        target.clamp(0.0, max)
+                    };
+                    self.backend
+                        .set_param(voice, VoiceParam::Seek(state.position_samples as usize));
+                } else {
+                    self.backend.set_param(
+                        voice,
+                        VoiceParam::Seek(duration_to_samples(position, self.backend.sample_rate())),
+                    );
+                }
+            }
+            SeekBy(voice, delta_seconds) => {
+                if let Some(state) = self.voice_states.get_mut(&voice) {
+                    state.delay_remaining_secs = 0.0;
+                    let delta = delta_seconds * state.sample_rate as f64;
+                    let max = state.region_len_samples as f64;
+                    let target = state.position_samples + delta;
+                    state.position_samples = if state.looped && max > 0.0 {
+                        target.rem_euclid(max)
+                    } else {
+                        target.clamp(0.0, max)
+                    };
+                    self.backend
+                        .set_param(voice, VoiceParam::Seek(state.position_samples as usize));
                 }
             }
             Stop(voice) => {

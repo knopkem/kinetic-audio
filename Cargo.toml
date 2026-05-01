@@ -2,9 +2,11 @@
 name = "kinetic-audio"
 version = "0.1.0"
 edition = "2021"
-authors = ["Your Name <you@example.com>"]
+authors = ["Michael Knopke <second.sons.dev@gmail.com>"]
 license = "MIT OR Apache-2.0"
-repository = "https://github.com/your-username/kinetic-audio"
+repository = "https://github.com/knopkem/kinetic-audio"
+homepage = "https://github.com/knopkem/kinetic-audio"
+readme = "README.md"
 description = "Cross-platform game audio engine for Rust (native + WASM)"
 keywords = ["audio", "gamedev", "wasm", "web-audio", "spatial-audio"]
 categories = ["game-development", "multimedia::audio"]

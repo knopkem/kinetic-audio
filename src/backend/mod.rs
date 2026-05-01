@@ -41,6 +41,12 @@ pub enum VoiceParam {
     Pan(f32),
     /// Playback rate (0.5 .. 4.0).
     Rate(f32),
+    /// Pause playback while preserving the current position.
+    Pause,
+    /// Resume playback after a pause.
+    Resume,
+    /// Seek to a sample offset within the voice's playback region.
+    Seek(usize),
     /// Stop the voice at the end of the current loop (if looping).
     StopAfterLoop,
     /// Immediately fade out and stop.

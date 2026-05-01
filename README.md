@@ -2,7 +2,7 @@
 
 Cross-platform game audio engine for Rust with one API for native desktop (`cpal`) and browser/WASM (Web Audio API).
 
-**Status:** pre-release / active development. Core playback, spatial audio, sprites, tweening, bus routing, and optional multi-format decoding are implemented.
+**Status:** v0.1 scope / public beta. The crate is aimed at 2D games and general game-audio playback on native + wasm. Core playback, spatial audio, sprites, tweening, buses, and optional multi-format decoding are implemented.
 
 ## Feature matrix
 
@@ -12,6 +12,7 @@ Cross-platform game audio engine for Rust with one API for native desktop (`cpal
 | OGG / MP3 / FLAC / AAC via `symphonia` | ✅ | ✅ |
 | Volume / pan / rate control | ✅ | ✅ |
 | Delayed playback | ✅ | ✅ |
+| Pause / resume / seek | ✅ | ✅ |
 | Looping, stop-after-loop, fade-out | ✅ | ✅ |
 | 3D positional audio | ✅ | ✅ |
 | Live listener / source movement updates | ✅ | ✅ |
@@ -22,10 +23,10 @@ Cross-platform game audio engine for Rust with one API for native desktop (`cpal
 | `NullBackend` for tests | ✅ | ✅ |
 | Native HRTF convolution | ❌ | n/a |
 
-## Current limitations
+## Current limitations / non-goals for v0.1
 
-- `add_bus_effect()` runs Rust DSP on the native `cpal` backend. The Web Audio backend currently ignores Rust-side bus effects.
-- The `hrtf` feature flag is still reserved; native spatialization uses distance attenuation plus constant-power pan rather than HRTF convolution.
+- `add_bus_effect()` runs Rust DSP on the native `cpal` backend. The Web Audio backend currently ignores Rust-side bus effects. This is intentionally **not** a v0.1 release blocker for 2D/native+wasm game playback.
+- The `hrtf` feature flag remains reserved. Native spatialization currently uses distance attenuation plus constant-power pan rather than HRTF convolution. HRTF is future work, not part of the first public release target.
 
 ## Quick start
 
@@ -46,6 +47,9 @@ let sound = manager.load_sound(include_bytes!("assets/gunshot.wav"), "wav")?;
 let mut handle = manager.play(sound, PlaybackSettings::default())?;
 handle.set_volume(0.6);
 handle.set_pan(-0.4);
+handle.pause();
+handle.resume();
+handle.seek_to(std::time::Duration::from_millis(250));
 
 manager.update(std::time::Duration::from_millis(16));
 ```

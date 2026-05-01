@@ -84,6 +84,7 @@ struct Voice {
     pan: f32,
     rate: f32,
     looped: bool,
+    paused: bool,
     stop_after_loop: bool,
     delay_remaining: usize,
     /// Fade-out state: `Some((total_samples, elapsed_samples))`.
@@ -217,6 +218,7 @@ impl Backend for CpalBackend {
                                             pan: settings.pan,
                                             rate: settings.rate,
                                             looped: settings.looped,
+                                            paused: false,
                                             stop_after_loop: false,
                                             delay_remaining: settings.delay_samples,
                                             fade_out: None,
@@ -231,6 +233,14 @@ impl Backend for CpalBackend {
                                             VoiceParam::Volume(x) => v.volume = x,
                                             VoiceParam::Pan(x) => v.pan = x,
                                             VoiceParam::Rate(x) => v.rate = x,
+                                            VoiceParam::Pause => v.paused = true,
+                                            VoiceParam::Resume => v.paused = false,
+                                            VoiceParam::Seek(offset) => {
+                                                let region_len = v.end_sample.saturating_sub(v.start_sample);
+                                                let clamped = offset.min(region_len);
+                                                v.cursor = v.start_sample as f64 + clamped as f64;
+                                                v.delay_remaining = 0;
+                                            }
                                             VoiceParam::StopAfterLoop => v.stop_after_loop = true,
                                             VoiceParam::FadeOut(dur) => {
                                                 let total = (dur.as_secs_f32() * sample_rate as f32) as usize;
@@ -264,6 +274,7 @@ impl Backend for CpalBackend {
                         // Mix voices into their respective bus (or master).
                         for (id, v) in voices.iter_mut() {
                             if !v.active { continue; }
+                            if v.paused { continue; }
 
                             // Render this voice into a temporary per-voice buffer.
                             let dest: &mut Vec<Frame> = if let Some(bus_id) = v.bus {

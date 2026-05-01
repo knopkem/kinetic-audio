@@ -70,14 +70,102 @@ struct WebVoice {
     panner: Option<PannerNode>,
     stereo_panner: Option<StereoPannerNode>,
     onended: Option<Closure<dyn FnMut()>>,
-    _buffer: BufferHandle,
+    buffer: BufferHandle,
+    buffer_sample_rate: f64,
+    region_start_secs: f64,
     scheduled_start_time: f64,
     region_duration_secs: f64,
     looped: bool,
+    rate: f32,
+    paused: bool,
+    paused_offset_secs: f64,
 }
 
 fn scheduled_source(source: &AudioBufferSourceNode) -> &AudioScheduledSourceNode {
     source.unchecked_ref::<AudioScheduledSourceNode>()
+}
+
+impl WebAudioBackend {
+    fn current_offset_secs_at(voice: &WebVoice, now: f64) -> f64 {
+        if voice.paused {
+            return voice.paused_offset_secs.min(voice.region_duration_secs);
+        }
+
+        if now < voice.scheduled_start_time {
+            return 0.0;
+        }
+
+        let elapsed = (now - voice.scheduled_start_time) * voice.rate.max(0.001) as f64;
+        if voice.looped && voice.region_duration_secs > 0.0 {
+            elapsed % voice.region_duration_secs
+        } else {
+            elapsed.min(voice.region_duration_secs)
+        }
+    }
+
+    fn replace_source(
+        &mut self,
+        voice_id: VoiceId,
+        offset_secs: f64,
+        start_when: f64,
+    ) -> Result<(), AudioError> {
+        let Some(voice) = self.voices.get_mut(voice_id) else {
+            return Err(AudioError::InvalidHandle);
+        };
+
+        let Some(buffer) = self.buffers.get(voice.buffer).cloned() else {
+            return Err(AudioError::InvalidHandle);
+        };
+
+        let offset_secs = offset_secs.clamp(0.0, voice.region_duration_secs);
+        if !voice.looped && offset_secs >= voice.region_duration_secs {
+            scheduled_source(&voice.source).set_onended(None);
+            let _ = scheduled_source(&voice.source).stop();
+            self.finished_queue.borrow_mut().push(voice_id);
+            return Ok(());
+        }
+
+        scheduled_source(&voice.source).set_onended(None);
+        let _ = scheduled_source(&voice.source).stop();
+
+        let source = AudioBufferSourceNode::new(&self.context)
+            .map_err(|e| AudioError::DeviceUnavailable(format!("source node: {:?}", e)))?;
+        source.set_buffer(Some(&buffer));
+        source.playback_rate().set_value(voice.rate);
+        if voice.looped {
+            source.set_loop(true);
+            source.set_loop_start(voice.region_start_secs);
+            source.set_loop_end(voice.region_start_secs + voice.region_duration_secs);
+        }
+        source
+            .connect_with_audio_node(voice.panner.as_ref().expect("panner exists"))
+            .map_err(|e| AudioError::DeviceUnavailable(format!("connect: {:?}", e)))?;
+
+        let finished_queue = self.finished_queue.clone();
+        let onended = Closure::wrap(Box::new(move || {
+            finished_queue.borrow_mut().push(voice_id);
+        }) as Box<dyn FnMut()>);
+        scheduled_source(&source).set_onended(Some(onended.as_ref().unchecked_ref()));
+
+        let absolute_offset = voice.region_start_secs + offset_secs;
+        let start_result = if voice.looped {
+            source.start_with_when_and_grain_offset(start_when, absolute_offset)
+        } else {
+            source.start_with_when_and_grain_offset_and_grain_duration(
+                start_when,
+                absolute_offset,
+                voice.region_duration_secs - offset_secs,
+            )
+        };
+        start_result.map_err(|e| AudioError::DeviceUnavailable(format!("start: {:?}", e)))?;
+
+        voice.source = source;
+        voice.onended = Some(onended);
+        voice.paused = false;
+        voice.paused_offset_secs = offset_secs;
+        voice.scheduled_start_time = start_when - offset_secs / voice.rate.max(0.001) as f64;
+        Ok(())
+    }
 }
 
 impl Backend for WebAudioBackend {
@@ -248,10 +336,15 @@ impl Backend for WebAudioBackend {
             panner: panner.clone(),
             stereo_panner: stereo_panner.clone(),
             onended: None,
-            _buffer: buffer,
+            buffer,
+            buffer_sample_rate: buffer_rate,
+            region_start_secs: offset_secs,
             scheduled_start_time,
             region_duration_secs,
             looped: settings.looped,
+            rate: settings.rate,
+            paused: false,
+            paused_offset_secs: 0.0,
         });
         let finished_queue = self.finished_queue.clone();
         let onended = Closure::wrap(Box::new(move || {
@@ -293,7 +386,36 @@ impl Backend for WebAudioBackend {
                     stereo_panner.pan().set_value(pan);
                 }
             }
-            VoiceParam::Rate(rate) => v.source.playback_rate().set_value(rate),
+            VoiceParam::Rate(rate) => {
+                let now = self.context.current_time();
+                let offset = Self::current_offset_secs_at(v, now);
+                v.rate = rate;
+                v.source.playback_rate().set_value(rate);
+                v.scheduled_start_time = now - offset / v.rate.max(0.001) as f64;
+            }
+            VoiceParam::Pause => {
+                let now = self.context.current_time();
+                v.paused_offset_secs = Self::current_offset_secs_at(v, now);
+                v.paused = true;
+                scheduled_source(&v.source).set_onended(None);
+                let _ = scheduled_source(&v.source).stop();
+            }
+            VoiceParam::Resume => {
+                if v.paused {
+                    let offset = v.paused_offset_secs;
+                    let now = self.context.current_time();
+                    let _ = self.replace_source(voice, offset, now);
+                }
+            }
+            VoiceParam::Seek(offset_samples) => {
+                let offset_secs = offset_samples as f64 / v.buffer_sample_rate;
+                if v.paused {
+                    v.paused_offset_secs = offset_secs.min(v.region_duration_secs);
+                } else {
+                    let now = self.context.current_time();
+                    let _ = self.replace_source(voice, offset_secs, now);
+                }
+            }
             VoiceParam::Position(pos) => {
                 if let Some(ref p) = v.panner {
                     p.set_position(pos.x as f64, pos.y as f64, pos.z as f64);
@@ -302,16 +424,18 @@ impl Backend for WebAudioBackend {
             VoiceParam::StopAfterLoop => {
                 if v.looped {
                     let now = self.context.current_time();
-                    let playback_rate = v.source.playback_rate().value().max(0.001) as f64;
+                    let playback_rate = v.rate.max(0.001) as f64;
                     let cycle_secs = v.region_duration_secs / playback_rate;
-                    let remaining = if now < v.scheduled_start_time {
+                    let offset = Self::current_offset_secs_at(v, now);
+                    let remaining = if v.paused {
+                        cycle_secs - (offset / playback_rate)
+                    } else if now < v.scheduled_start_time {
                         (v.scheduled_start_time - now) + cycle_secs
                     } else {
-                        let elapsed = now - v.scheduled_start_time;
-                        let phase = elapsed % cycle_secs;
+                        let phase = offset / playback_rate;
                         if phase == 0.0 { cycle_secs } else { cycle_secs - phase }
                     };
-                    let _ = scheduled_source(&v.source).stop_with_when(now + remaining);
+                    let _ = scheduled_source(&v.source).stop_with_when(now + remaining.max(0.0));
                 }
             }
             VoiceParam::FadeOut(duration) => {
@@ -328,7 +452,13 @@ impl Backend for WebAudioBackend {
                 let _ = param.cancel_scheduled_values(now);
                 let _ = param.set_value_at_time(current, now);
                 let _ = param.linear_ramp_to_value_at_time(0.0, now + secs);
-                let _ = scheduled_source(&v.source).stop_with_when(now + secs);
+                if v.paused {
+                    scheduled_source(&v.source).set_onended(None);
+                    let _ = scheduled_source(&v.source).stop();
+                    self.finished_queue.borrow_mut().push(voice);
+                } else {
+                    let _ = scheduled_source(&v.source).stop_with_when(now + secs);
+                }
             }
         }
     }
