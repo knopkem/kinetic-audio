@@ -210,6 +210,65 @@ fn add_and_remove_bus() {
     // No panic expected.
 }
 
+#[test]
+fn soloed_bus_mutes_other_buses() {
+    let mut m = null_manager();
+    let a = m
+        .add_bus(MixSettings {
+            name: "a".into(),
+            gain: 1.0,
+            muted: false,
+            soloed: false,
+        })
+        .expect("add_bus a failed");
+    let b = m
+        .add_bus(MixSettings {
+            name: "b".into(),
+            gain: 1.0,
+            muted: false,
+            soloed: false,
+        })
+        .expect("add_bus b failed");
+
+    m.set_bus_soloed(a, true);
+
+    assert_eq!(m.backend().bus_configs.get(&a), Some(&(1.0, false)));
+    assert_eq!(m.backend().bus_configs.get(&b), Some(&(1.0, true)));
+
+    m.set_bus_soloed(a, false);
+
+    assert_eq!(m.backend().bus_configs.get(&a), Some(&(1.0, false)));
+    assert_eq!(m.backend().bus_configs.get(&b), Some(&(1.0, false)));
+}
+
+#[test]
+fn playback_track_routes_to_requested_bus() {
+    let bytes = make_wav(100);
+    let mut m = null_manager();
+    let key = m.load_sound(&bytes, "wav").expect("load failed");
+    let bus_id = m
+        .add_bus(MixSettings {
+            name: "ui".into(),
+            gain: 1.0,
+            muted: false,
+            soloed: false,
+        })
+        .expect("add_bus failed");
+
+    let handle = m
+        .play(
+            key,
+            PlaybackSettings {
+                track: Some(bus_id),
+                ..Default::default()
+            },
+        )
+        .expect("play failed");
+
+    let voice = m.backend().voices.get(handle.id()).expect("voice missing");
+    assert_eq!(voice.settings.bus, Some(bus_id));
+}
+
 // ── effect chain ─────────────────────────────────────────────────────────────
 
 #[test]

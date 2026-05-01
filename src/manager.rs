@@ -2,7 +2,7 @@
 //!
 //! This is the only type most users interact with directly.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -40,6 +40,13 @@ struct ActiveTween {
     elapsed_secs: f32,
 }
 
+struct ManagedVoiceState {
+    base_volume: f32,
+    base_pan: f32,
+    spatial: Option<SpatialSettings>,
+    spatialized_once: bool,
+}
+
 /// Configuration passed to `AudioManager::new()`.
 #[derive(Clone, Debug)]
 pub struct AudioConfig {
@@ -71,6 +78,7 @@ pub struct AudioManager<B: Backend> {
     buses: SlotMap<BusId, Bus>,
     listener: Listener,
     active_tweens: Vec<ActiveTween>,
+    voice_states: HashMap<VoiceId, ManagedVoiceState>,
     /// Voices that have naturally finished playback (populated by `update()`).
     finished: HashSet<VoiceId>,
     #[cfg(not(target_arch = "wasm32"))]
@@ -96,8 +104,6 @@ impl<B: Backend> AudioManager<B> {
                 name: "master".into(),
                 ..Default::default()
             },
-            effects: Vec::new(),
-            input: Vec::new(),
         });
         buses[master_id].id = master_id;
 
@@ -112,6 +118,7 @@ impl<B: Backend> AudioManager<B> {
             buses,
             listener,
             active_tweens: Vec::new(),
+            voice_states: HashMap::new(),
             finished: HashSet::new(),
             #[cfg(not(target_arch = "wasm32"))]
             command_rx,
@@ -218,6 +225,15 @@ impl<B: Backend> AudioManager<B> {
         };
 
         let voice = self.backend.play(sound.buffer, voice_settings)?;
+        self.voice_states.insert(
+            voice,
+            ManagedVoiceState {
+                base_volume: settings.volume,
+                base_pan: settings.pan,
+                spatial,
+                spatialized_once: spatial.is_some(),
+            },
+        );
         let bridge = self.make_bridge();
         Ok(SoundHandle { voice, manager: bridge, volume, pan, rate: settings.rate })
     }
@@ -275,6 +291,15 @@ impl<B: Backend> AudioManager<B> {
         };
 
         let voice = self.backend.play(sound.buffer, voice_settings)?;
+        self.voice_states.insert(
+            voice,
+            ManagedVoiceState {
+                base_volume: settings.volume,
+                base_pan: settings.pan,
+                spatial,
+                spatialized_once: spatial.is_some(),
+            },
+        );
 
         let bridge = self.make_bridge();
         let handle = SoundHandle {
@@ -296,6 +321,7 @@ impl<B: Backend> AudioManager<B> {
     pub fn set_listener_position(&mut self, pos: glam::Vec3) {
         self.listener.position = pos;
         self.backend.set_listener(self.listener);
+        self.refresh_spatial_voices();
     }
 
     /// Set the listener's orientation.
@@ -313,6 +339,7 @@ impl<B: Backend> AudioManager<B> {
         self.listener.forward = forward;
         self.listener.up = up;
         self.backend.set_listener(self.listener);
+        self.refresh_spatial_voices();
     }
 
     // -------------------------------------------------------------------
@@ -324,11 +351,10 @@ impl<B: Backend> AudioManager<B> {
         let id = self.buses.insert(Bus {
             id: BusId::default(),
             settings: settings.clone(),
-            effects: Vec::new(),
-            input: Vec::new(),
         });
         self.buses[id].id = id;
         self.backend.register_bus(id);
+        self.sync_bus_configs();
         Ok(id)
     }
 
@@ -336,16 +362,15 @@ impl<B: Backend> AudioManager<B> {
     pub fn remove_bus(&mut self, id: BusId) {
         self.buses.remove(id);
         self.backend.unregister_bus(id);
+        self.sync_bus_configs();
     }
 
     /// Set per-bus gain in decibels.
     pub fn set_bus_volume_db(&mut self, id: BusId, db: f32) {
-        let gain = crate::math::Decibels::to_linear(db).clamp(0.0, 2.0);
         if let Some(bus) = self.buses.get_mut(id) {
-            bus.settings.gain = gain;
+            bus.settings.gain = crate::math::Decibels::to_linear(db).clamp(0.0, 2.0);
         }
-        let muted = self.buses.get(id).map(|b| b.settings.muted).unwrap_or(false);
-        self.backend.set_bus_config(id, gain, muted);
+        self.sync_bus_configs();
     }
 
     /// Mute or un-mute a bus.
@@ -353,8 +378,15 @@ impl<B: Backend> AudioManager<B> {
         if let Some(bus) = self.buses.get_mut(id) {
             bus.settings.muted = muted;
         }
-        let gain = self.buses.get(id).map(|b| b.settings.gain).unwrap_or(1.0);
-        self.backend.set_bus_config(id, gain, muted);
+        self.sync_bus_configs();
+    }
+
+    /// Solo or un-solo a bus.
+    pub fn set_bus_soloed(&mut self, id: BusId, soloed: bool) {
+        if let Some(bus) = self.buses.get_mut(id) {
+            bus.settings.soloed = soloed;
+        }
+        self.sync_bus_configs();
     }
 
     /// Add a DSP effect to a bus's effect chain.
@@ -389,21 +421,35 @@ impl<B: Backend> AudioManager<B> {
 
         // Advance active tweens.
         let dt_secs = dt.as_secs_f32();
-        self.active_tweens.retain_mut(|tw| {
+        let mut active_tweens = std::mem::take(&mut self.active_tweens);
+        self.active_tweens = active_tweens
+            .drain(..)
+            .filter_map(|mut tw| {
             tw.elapsed_secs += dt_secs;
             let t = tw.tween.sample(tw.elapsed_secs);
             let val = tw.start_val + (tw.end_val - tw.start_val) * t;
-            let param = match tw.target {
-                TweenTarget::Volume => VoiceParam::Volume(val),
-                TweenTarget::Pan => VoiceParam::Pan(val),
-            };
-            self.backend.set_param(tw.voice, param);
+            if let Some(state) = self.voice_states.get_mut(&tw.voice) {
+                match tw.target {
+                    TweenTarget::Volume => state.base_volume = val,
+                    TweenTarget::Pan => state.base_pan = val,
+                }
+                self.refresh_voice_mix(tw.voice);
+            } else {
+                let param = match tw.target {
+                    TweenTarget::Volume => VoiceParam::Volume(val),
+                    TweenTarget::Pan => VoiceParam::Pan(val),
+                };
+                self.backend.set_param(tw.voice, param);
+            }
             // Keep tween until it has fully reached its end.
-            tw.elapsed_secs < tw.tween.duration.as_secs_f32()
-        });
+            (tw.elapsed_secs < tw.tween.duration.as_secs_f32()).then_some(tw)
+        })
+        .collect();
 
         self.backend.tick(dt);
         for id in self.backend.finished_voices() {
+            self.voice_states.remove(&id);
+            self.active_tweens.retain(|tw| tw.voice != id);
             self.finished.insert(id);
         }
     }
@@ -434,6 +480,11 @@ impl<B: Backend> AudioManager<B> {
     /// Retrieve a loaded sound by key. Returns `None` if the key is invalid.
     pub fn get_sound(&self, key: SoundKey) -> Option<&SoundData> {
         self.sounds.get(key)
+    }
+
+    /// Expose the backend for inspection in tests and advanced integrations.
+    pub fn backend(&self) -> &B {
+        &self.backend
     }
     // -------------------------------------------------------------------
 
@@ -491,22 +542,73 @@ impl<B: Backend> AudioManager<B> {
         }
     }
 
-    fn track_to_bus(&self, _track: TrackId) -> BusId {
-        // Placeholder: for now map every track to master.
-        self.buses.keys().next().unwrap_or_else(BusId::default)
+    fn refresh_voice_mix(&mut self, voice: VoiceId) {
+        let Some(state) = self.voice_states.get(&voice) else {
+            return;
+        };
+        let (volume, pan) =
+            self.effective_pan_volume(state.base_volume, state.base_pan, state.spatial);
+        self.backend.set_param(voice, VoiceParam::Volume(volume));
+        self.backend.set_param(voice, VoiceParam::Pan(pan));
+
+        if let Some(spatial) = state.spatial {
+            self.backend
+                .set_param(voice, VoiceParam::Position(spatial.position));
+        } else if state.spatialized_once {
+            self.backend
+                .set_param(voice, VoiceParam::Position(self.listener.position));
+        }
+    }
+
+    fn refresh_spatial_voices(&mut self) {
+        let voices: Vec<VoiceId> = self.voice_states.keys().copied().collect();
+        for voice in voices {
+            self.refresh_voice_mix(voice);
+        }
+    }
+
+    fn sync_bus_configs(&mut self) {
+        let any_soloed = self.buses.values().any(|bus| bus.settings.soloed);
+        let configs: Vec<(BusId, f32, bool)> = self
+            .buses
+            .iter()
+            .map(|(id, bus)| {
+                let effective_muted =
+                    bus.settings.muted || (any_soloed && !bus.settings.soloed);
+                (id, bus.settings.gain, effective_muted)
+            })
+            .collect();
+
+        for (id, gain, muted) in configs {
+            self.backend.set_bus_config(id, gain, muted);
+        }
+    }
+
+    fn track_to_bus(&self, track: TrackId) -> BusId {
+        track
     }
 
     fn apply_command(&mut self, cmd: ManagerCommand) {
         use ManagerCommand::*;
         match cmd {
             SetVolume(voice, vol) => {
-                self.backend.set_param(voice, VoiceParam::Volume(vol));
+                if let Some(state) = self.voice_states.get_mut(&voice) {
+                    state.base_volume = vol;
+                    self.refresh_voice_mix(voice);
+                } else {
+                    self.backend.set_param(voice, VoiceParam::Volume(vol));
+                }
                 // Cancel any in-flight volume tween for this voice.
                 self.active_tweens
                     .retain(|tw| !(tw.voice == voice && tw.target == TweenTarget::Volume));
             }
             SetPan(voice, pan) => {
-                self.backend.set_param(voice, VoiceParam::Pan(pan));
+                if let Some(state) = self.voice_states.get_mut(&voice) {
+                    state.base_pan = pan;
+                    self.refresh_voice_mix(voice);
+                } else {
+                    self.backend.set_param(voice, VoiceParam::Pan(pan));
+                }
                 self.active_tweens
                     .retain(|tw| !(tw.voice == voice && tw.target == TweenTarget::Pan));
             }
@@ -514,22 +616,41 @@ impl<B: Backend> AudioManager<B> {
                 self.backend.set_param(voice, VoiceParam::Rate(rate));
             }
             SetPosition(voice, maybe_pos) => {
-                if let Some(pos) = maybe_pos {
+                if let Some(state) = self.voice_states.get_mut(&voice) {
+                    match maybe_pos {
+                        Some(pos) => {
+                            let mut spatial = state.spatial.unwrap_or_default();
+                            spatial.position = pos;
+                            state.spatial = Some(spatial);
+                            state.spatialized_once = true;
+                        }
+                        None => {
+                            state.spatial = None;
+                        }
+                    }
+                    self.refresh_voice_mix(voice);
+                } else if let Some(pos) = maybe_pos {
                     self.backend.set_param(voice, VoiceParam::Position(pos));
                 }
             }
             FadeVolume(voice, target, tween) => {
                 if tween.duration.is_zero() {
-                    self.backend.set_param(voice, VoiceParam::Volume(target));
+                    if let Some(state) = self.voice_states.get_mut(&voice) {
+                        state.base_volume = target;
+                        self.refresh_voice_mix(voice);
+                    } else {
+                        self.backend.set_param(voice, VoiceParam::Volume(target));
+                    }
                     self.active_tweens
                         .retain(|tw| !(tw.voice == voice && tw.target == TweenTarget::Volume));
                 } else {
-                    // Use the last known value as the start (0.0 is a safe fallback).
+                    // Use the last known in-flight value, otherwise the tracked voice state.
                     let start_val = self
                         .active_tweens
                         .iter()
                         .rfind(|tw| tw.voice == voice && tw.target == TweenTarget::Volume)
                         .map(|tw| tw.start_val + (tw.end_val - tw.start_val) * tw.tween.sample(tw.elapsed_secs))
+                        .or_else(|| self.voice_states.get(&voice).map(|s| s.base_volume))
                         .unwrap_or(0.0);
                     self.active_tweens
                         .retain(|tw| !(tw.voice == voice && tw.target == TweenTarget::Volume));
@@ -545,7 +666,12 @@ impl<B: Backend> AudioManager<B> {
             }
             FadePan(voice, target, tween) => {
                 if tween.duration.is_zero() {
-                    self.backend.set_param(voice, VoiceParam::Pan(target));
+                    if let Some(state) = self.voice_states.get_mut(&voice) {
+                        state.base_pan = target;
+                        self.refresh_voice_mix(voice);
+                    } else {
+                        self.backend.set_param(voice, VoiceParam::Pan(target));
+                    }
                     self.active_tweens
                         .retain(|tw| !(tw.voice == voice && tw.target == TweenTarget::Pan));
                 } else {
@@ -554,6 +680,7 @@ impl<B: Backend> AudioManager<B> {
                         .iter()
                         .rfind(|tw| tw.voice == voice && tw.target == TweenTarget::Pan)
                         .map(|tw| tw.start_val + (tw.end_val - tw.start_val) * tw.tween.sample(tw.elapsed_secs))
+                        .or_else(|| self.voice_states.get(&voice).map(|s| s.base_pan))
                         .unwrap_or(0.0);
                     self.active_tweens
                         .retain(|tw| !(tw.voice == voice && tw.target == TweenTarget::Pan));
@@ -570,6 +697,7 @@ impl<B: Backend> AudioManager<B> {
             Stop(voice) => {
                 // Cancel any tweens targeting this voice.
                 self.active_tweens.retain(|tw| tw.voice != voice);
+                self.voice_states.remove(&voice);
                 self.backend.stop_voice(voice);
             }
             StopAfterLoop(voice) => {
@@ -580,6 +708,18 @@ impl<B: Backend> AudioManager<B> {
                 self.backend.set_param(voice, VoiceParam::FadeOut(dur));
             }
         }
+    }
+}
+
+// ============================================================================
+// Convenience impl for DefaultBackend
+// ============================================================================
+
+#[cfg(not(target_arch = "wasm32"))]
+impl AudioManager<crate::DefaultBackend> {
+    /// Create using the platform's default backend.
+    pub fn new_default(config: AudioConfig) -> Result<Self, crate::backend::AudioError> {
+        Self::new(config)
     }
 }
 
@@ -638,6 +778,82 @@ mod tests {
     }
 
     #[test]
+    fn moving_listener_recomputes_active_voice_mix() {
+        let mut manager = AudioManager::<NullBackend>::new(Default::default()).unwrap();
+        manager.set_listener_position(Vec3::ZERO);
+        manager.set_listener_orientation(Vec3::Z, Vec3::Y);
+        let key = manager.load_raw(Arc::new(vec![Frame::mono(0.25); 32]), 44_100);
+        let handle = manager
+            .play(
+                key,
+                PlaybackSettings {
+                    spatial: Some(SpatialSettings {
+                        model: DistanceModel::Linear,
+                        ref_distance: 0.0,
+                        max_distance: 100.0,
+                        rolloff_factor: 1.0,
+                        position: Vec3::new(50.0, 0.0, 0.0),
+                    }),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+
+        let initial_pan = manager.backend.voices.get(handle.voice).unwrap().settings.pan;
+        manager.set_listener_position(Vec3::new(50.0, 0.0, 0.0));
+        let voice = manager.backend.voices.get(handle.voice).unwrap();
+
+        assert!(initial_pan > 0.0);
+        assert_eq!(voice.settings.volume, 1.0);
+        assert!(voice.settings.pan.abs() < 1e-4);
+    }
+
+    #[test]
+    fn moving_voice_updates_active_spatial_mix() {
+        let mut manager = AudioManager::<NullBackend>::new(Default::default()).unwrap();
+        manager.set_listener_position(Vec3::ZERO);
+        manager.set_listener_orientation(Vec3::Z, Vec3::Y);
+        let key = manager.load_raw(Arc::new(vec![Frame::mono(0.25); 32]), 44_100);
+        let mut handle = manager.play(key, PlaybackSettings::default()).unwrap();
+
+        handle.set_position(Vec3::new(25.0, 0.0, 25.0));
+        manager.update(Duration::ZERO);
+
+        let voice = manager.backend.voices.get(handle.voice).unwrap();
+        assert!(voice.settings.volume < 1.0);
+        assert!(voice.settings.pan > 0.0);
+    }
+
+    #[test]
+    fn clear_position_restores_base_mix() {
+        let mut manager = AudioManager::<NullBackend>::new(Default::default()).unwrap();
+        manager.set_listener_position(Vec3::ZERO);
+        manager.set_listener_orientation(Vec3::Z, Vec3::Y);
+        let key = manager.load_raw(Arc::new(vec![Frame::mono(0.25); 32]), 44_100);
+        let mut handle = manager
+            .play(
+                key,
+                PlaybackSettings {
+                    volume: 0.8,
+                    pan: -0.25,
+                    spatial: Some(SpatialSettings {
+                        position: Vec3::new(40.0, 0.0, 0.0),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+
+        handle.clear_position();
+        manager.update(Duration::ZERO);
+
+        let voice = manager.backend.voices.get(handle.voice).unwrap();
+        assert!((voice.settings.volume - 0.8).abs() < 1e-4);
+        assert!((voice.settings.pan + 0.25).abs() < 1e-4);
+    }
+
+    #[test]
     fn resume_is_forwarded_to_backend() {
         let mut manager = AudioManager::<NullBackend>::new(Default::default()).unwrap();
         manager.resume().unwrap();
@@ -663,17 +879,5 @@ mod tests {
             manager.backend.voices.get(handle.voice).is_none(),
             "finished voices should be reclaimed during update"
         );
-    }
-}
-
-// ============================================================================
-// Convenience impl for DefaultBackend
-// ============================================================================
-
-#[cfg(not(target_arch = "wasm32"))]
-impl AudioManager<crate::DefaultBackend> {
-    /// Create using the platform's default backend.
-    pub fn new_default(config: AudioConfig) -> Result<Self, crate::backend::AudioError> {
-        Self::new(config)
     }
 }

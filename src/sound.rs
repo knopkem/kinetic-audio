@@ -43,6 +43,11 @@ impl SoundData {
     pub fn sample_rate(&self) -> u32 {
         self.sample_rate
     }
+
+    /// Number of source channels before the backend normalizes to stereo frames.
+    pub fn channels(&self) -> u16 {
+        self.channels
+    }
 }
 
 // ── Sound Key ───────────────────────────────────────────────────────────────
@@ -134,8 +139,13 @@ pub(crate) enum ManagerCommand {
 }
 
 impl SoundHandle {
+    /// Backend voice id for this handle.
+    pub fn id(&self) -> VoiceId {
+        self.voice
+    }
+
     /// Stop the voice immediately.
-    pub fn stop(mut self) {
+    pub fn stop(self) {
         self.send_cmd(ManagerCommand::Stop(self.voice));
     }
 

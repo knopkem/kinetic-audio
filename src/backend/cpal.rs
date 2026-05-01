@@ -26,7 +26,9 @@ const COMMAND_QUEUE_CAP: usize = 512;
 
 /// Per-bus state visible to both the main thread and the audio callback.
 pub struct BusState {
+    /// Linear gain applied after bus accumulation.
     pub gain: f32,
+    /// Whether the bus is currently muted.
     pub muted: bool,
     /// Effect chain processed in the audio callback.
     pub effects: Vec<Box<dyn Effect + Send>>,
@@ -155,7 +157,7 @@ impl Backend for CpalBackend {
             .map_err(|e| AudioError::DeviceUnavailable(e.to_string()))?
             .collect();
 
-        let range = configs
+        let range = *configs
             .iter()
             .find(|c| c.sample_format() == cpal::SampleFormat::F32 && c.channels() == 2)
             .or_else(|| {
@@ -164,8 +166,7 @@ impl Backend for CpalBackend {
                     .find(|c| c.sample_format() == cpal::SampleFormat::F32)
             })
             .or_else(|| configs.first())
-            .ok_or_else(|| AudioError::DeviceUnavailable("no supported stream config".into()))?
-            .clone();
+            .ok_or_else(|| AudioError::DeviceUnavailable("no supported stream config".into()))?;
 
         let sample_rate = if _config.sample_rate == 0 {
             range.min_sample_rate().0
@@ -191,9 +192,9 @@ impl Backend for CpalBackend {
                 &stream_config,
                 {
                     let mut voices: HashMap<VoiceId, Voice> = HashMap::with_capacity(MAX_VOICES);
-                    /// Per-bus accumulator buffers: bus_id -> (SharedBus, samples).
+                    // Per-bus accumulator buffers: bus_id -> (SharedBus, samples).
                     let mut bus_buffers: HashMap<BusId, (SharedBus, Vec<Frame>)> = HashMap::new();
-                    let mut rx = rx;
+                    let rx = rx;
                     let finished_tx = finished_tx;
                     let sample_rate = actual_rate;
                     move |data: &mut [f32], _: &cpal::OutputCallbackInfo| {
@@ -275,7 +276,7 @@ impl Backend for CpalBackend {
                                 &mut master_buf
                             };
 
-                            for frame_idx in 0..frames {
+                            for frame in dest.iter_mut().take(frames) {
                                 if v.delay_remaining > 0 {
                                     v.delay_remaining -= 1;
                                     continue;
@@ -305,8 +306,8 @@ impl Backend for CpalBackend {
                                 } else {
                                     1.0
                                 };
-                                dest[frame_idx].l += s.l * lg * v.volume * fade_gain;
-                                dest[frame_idx].r += s.r * rg * v.volume * fade_gain;
+                                frame.l += s.l * lg * v.volume * fade_gain;
+                                frame.r += s.r * rg * v.volume * fade_gain;
                                 v.cursor += v.rate as f64;
                             }
                         }

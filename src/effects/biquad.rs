@@ -42,11 +42,17 @@ pub enum FilterSlope {
 /// ```
 #[derive(Clone, Debug)]
 pub struct BiquadFilter {
+    /// Filter topology.
     pub mode: FilterMode,
+    /// Filter order / slope approximation.
     pub slope: FilterSlope,
+    /// Cutoff or center frequency in Hz, depending on the filter mode.
     pub cutoff_hz: f32,
+    /// Resonance / Q.
     pub resonance: f32,
+    /// Shelf / peak gain in decibels.
     pub gain_db: f32,
+    /// Processing sample rate in Hz.
     pub sample_rate: u32,
     // Coefficients.
     b0: f32,

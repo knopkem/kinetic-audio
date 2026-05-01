@@ -1,6 +1,5 @@
 //! Mixer: tracks, busses, and routing.
 
-use crate::effects::Effect;
 use crate::math::Frame;
 
 /// Opaque handle to a mixer bus.
@@ -41,31 +40,6 @@ impl Default for MixSettings {
 pub struct Bus {
     pub(crate) id: BusId,
     pub(crate) settings: MixSettings,
-    pub(crate) effects: Vec<Box<dyn Effect>>,
-    pub(crate) input: Vec<Frame>,
-}
-
-impl Bus {
-    /// Apply this bus's gain in-place to its input buffer.
-    pub(crate) fn apply_gain(&mut self) {
-        if self.settings.muted {
-            for f in &mut self.input {
-                *f = Frame::SILENCE;
-            }
-            return;
-        }
-        let g = self.settings.gain;
-        for f in &mut self.input {
-            *f = f.scale(g);
-        }
-    }
-
-    /// Run all effects on this bus's input buffer.
-    pub(crate) fn process_effects(&mut self, sample_rate: u32) {
-        for fx in &mut self.effects {
-            fx.process(&mut self.input, sample_rate);
-        }
-    }
 }
 
 /// Configuration for a per-voice send to a bus.

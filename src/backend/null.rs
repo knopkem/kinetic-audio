@@ -2,13 +2,14 @@
 //!
 //! Records every command to a `Vec` so tests can assert on behaviour.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
 use slotmap::SlotMap;
 
 use crate::backend::{
-    AudioError, Backend, BufferHandle, DeviceConfig, VoiceId, VoiceParam, VoiceSettings,
+    AudioError, Backend, BufferHandle, BusId, DeviceConfig, VoiceId, VoiceParam, VoiceSettings,
 };
 use crate::math::Frame;
 use crate::spatial::Listener;
@@ -21,28 +22,51 @@ pub struct NullBackend {
     pub voices: SlotMap<VoiceId, NullVoice>,
     /// Log of every backend call (for assertions).
     pub log: Vec<BackendLog>,
+    /// Latest bus config state.
+    pub bus_configs: HashMap<BusId, (f32, bool)>,
+    /// Output sample rate reported by the backend.
     pub sample_rate: u32,
 }
 
 /// A voice tracked by the null backend.
 pub struct NullVoice {
+    /// Uploaded buffer being played.
     pub buffer: BufferHandle,
+    /// Last-known voice settings.
     pub settings: VoiceSettings,
+    /// Whether the voice is still active.
     pub active: bool,
+    /// Whether the voice should be reported as finished.
     pub finished: bool,
 }
 
+/// Event log emitted by [`NullBackend`].
 #[derive(Clone, Debug, PartialEq)]
 pub enum BackendLog {
+    /// Backend startup.
     Start,
+    /// Backend shutdown.
     Stop,
+    /// Buffer upload: `(handle, frames, sample_rate)`.
     Upload(BufferHandle, usize, u32),
+    /// Voice start for a buffer.
     Play(BufferHandle),
+    /// Runtime parameter change: `(voice, debug_repr)`.
     SetParam(VoiceId, String),
+    /// Immediate voice stop.
     StopVoice(VoiceId),
+    /// Tick/update call.
     Tick(Duration),
+    /// Listener update.
     SetListener,
+    /// Resume request.
     Resume,
+    /// Bus registration.
+    RegisterBus(BusId),
+    /// Bus removal.
+    UnregisterBus(BusId),
+    /// Bus gain/mute update: `(bus, gain, muted)`.
+    SetBusConfig(BusId, f32, bool),
 }
 
 impl Backend for NullBackend {
@@ -51,6 +75,7 @@ impl Backend for NullBackend {
             buffers: SlotMap::with_key(),
             voices: SlotMap::with_key(),
             log: vec![BackendLog::Start],
+            bus_configs: HashMap::new(),
             sample_rate: if config.sample_rate == 0 {
                 44_100
             } else {
@@ -138,6 +163,21 @@ impl Backend for NullBackend {
 
     fn sample_rate(&self) -> u32 {
         self.sample_rate
+    }
+
+    fn register_bus(&mut self, id: BusId) {
+        self.bus_configs.entry(id).or_insert((1.0, false));
+        self.log.push(BackendLog::RegisterBus(id));
+    }
+
+    fn unregister_bus(&mut self, id: BusId) {
+        self.bus_configs.remove(&id);
+        self.log.push(BackendLog::UnregisterBus(id));
+    }
+
+    fn set_bus_config(&mut self, id: BusId, gain: f32, muted: bool) {
+        self.bus_configs.insert(id, (gain, muted));
+        self.log.push(BackendLog::SetBusConfig(id, gain, muted));
     }
 }
 

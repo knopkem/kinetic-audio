@@ -7,8 +7,8 @@
 //! use kinetic_audio::{AudioManager, DefaultBackend, AudioConfig};
 //!
 //! let mut manager = AudioManager::<DefaultBackend>::new(AudioConfig::default())?;
-//! let sound = manager.load_sound(include_bytes!("gunshot.wav"))?;
-//! let handle = manager.play(sound)?;
+//! let sound = manager.load_sound(include_bytes!("gunshot.wav"), "wav")?;
+//! let handle = manager.play(sound, Default::default())?;
 //! ```
 
 #![warn(missing_docs)]

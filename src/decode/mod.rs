@@ -43,7 +43,7 @@ pub fn decode(bytes: &[u8], hint: &str) -> Result<(Vec<crate::math::Frame>, u32)
 
     #[cfg(feature = "symphonia")]
     {
-        return decode_symphonia(bytes);
+        decode_symphonia(bytes)
     }
 
     #[cfg(not(feature = "symphonia"))]

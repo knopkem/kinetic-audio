@@ -1,83 +1,93 @@
 # `kinetic-audio`
 
-> Cross-platform game audio engine for Rust — identical API on native desktop (via `cpal`) and in the browser (via the Web Audio API).
+Cross-platform game audio engine for Rust with one API for native desktop (`cpal`) and browser/WASM (Web Audio API).
 
-**Status: pre-release / active development.** The core playback pipeline is working. Several features listed below are partially implemented or planned for upcoming milestones.
+**Status:** pre-release / active development. Core playback, spatial audio, sprites, tweening, bus routing, and optional multi-format decoding are implemented.
 
-## What works today
+## Feature matrix
 
 | Feature | Native | WASM |
 |---------|--------|------|
 | WAV playback | ✅ | ✅ |
+| OGG / MP3 / FLAC / AAC via `symphonia` | ✅ | ✅ |
 | Volume / pan / rate control | ✅ | ✅ |
-| Looping | ✅ | ✅ |
-| 3D positional audio (distance attenuation + stereo pan) | ✅ | ✅ (PannerNode) |
-| Spatial listener (position + orientation) | ✅ | ✅ |
-| Biquad filter DSP (7 modes, 12/24 dB slopes) | ✅ | ✅ |
-| Delay line (feedback, wet/dry) | ✅ | ✅ |
-| Mixer busses (gain, mute, solo) | ✅ | ✅ |
-| Sound sprite definitions | ✅ | ✅ |
-| Tween / easing types | ✅ | ✅ |
-| NullBackend for unit tests | ✅ | ✅ |
+| Delayed playback | ✅ | ✅ |
+| Looping, stop-after-loop, fade-out | ✅ | ✅ |
+| 3D positional audio | ✅ | ✅ |
+| Live listener / source movement updates | ✅ | ✅ |
+| Sound sprites / named regions | ✅ | ✅ |
+| Mixer bus routing, gain, mute, solo | ✅ | ✅ |
+| Bus DSP chain (`add_bus_effect`) | ✅ | ⚠️ |
+| Tweened volume / pan | ✅ | ✅ |
+| `NullBackend` for tests | ✅ | ✅ |
+| Native HRTF convolution | ❌ | n/a |
 
-## Known limitations (not yet implemented)
+## Current limitations
 
-- **Tween interpolation:** `fade_volume` / `fade_pan` apply the target instantly — time-based interpolation in `update()` is a stub.
-- **Sprite playback:** `SpriteData` / `SpriteRegion` types exist but `AudioManager::play_sprite()` is not yet implemented.
-- **Bus effect processing:** `BiquadFilter` and `DelayLine` are fully working DSP units, but the per-bus effect chain is not yet wired into the cpal audio callback.
-- **Bus routing (native):** Voices are all mixed directly to the master output; the `bus` field on `PlaybackSettings` has no effect on the native backend.
-- **`PlaybackSettings::delay`:** Field is reserved but ignored during playback.
-- **`FadeOut` / `StopAfterLoop`:** `VoiceParam` variants are defined but are no-ops in both backends.
-- **OGG / MP3 / FLAC:** The `symphonia` feature flag is reserved; only WAV is decoded today.
-- **HRTF:** The `hrtf` feature flag is reserved; no HRTF tables or DSP are included yet.
+- `add_bus_effect()` runs Rust DSP on the native `cpal` backend. The Web Audio backend currently ignores Rust-side bus effects.
+- The `hrtf` feature flag is still reserved; native spatialization uses distance attenuation plus constant-power pan rather than HRTF convolution.
 
 ## Quick start
 
 ```toml
-# Cargo.toml
 [dependencies]
 kinetic-audio = { version = "0.1", features = ["cpal-backend"] }
 
-# Browser / WASM targets
-[target.'cfg(target_arch = "wasm32")'.dependencies]
-kinetic-audio = { version = "0.1", features = ["web-backend"] }
+# Optional extra decoders.
+kinetic-audio = { version = "0.1", features = ["cpal-backend", "symphonia"] }
 ```
 
 ```rust
-use kinetic_audio::{AudioManager, DefaultBackend, AudioConfig, PlaybackSettings};
+use kinetic_audio::{AudioConfig, AudioManager, DefaultBackend, PlaybackSettings};
 
-// Create the manager (starts the audio device).
 let mut manager = AudioManager::<DefaultBackend>::new(AudioConfig::default())?;
+let sound = manager.load_sound(include_bytes!("assets/gunshot.wav"), "wav")?;
 
-// Load a WAV file (returns a re-usable key).
-let shot = manager.load_sound(include_bytes!("assets/gunshot.wav"))?;
-
-// Play it — get back a handle for live control.
-let mut handle = manager.play(shot, PlaybackSettings::default())?;
-
-// Change parameters while playing.
+let mut handle = manager.play(sound, PlaybackSettings::default())?;
 handle.set_volume(0.6);
-handle.set_pan(-0.4);  // slightly left
+handle.set_pan(-0.4);
 
-// Stop explicitly (dropping the handle does NOT stop the sound).
-handle.stop();
-
-// Call once per frame to flush commands and reclaim finished voices.
 manager.update(std::time::Duration::from_millis(16));
+```
+
+## Sound sprites
+
+```rust
+use kinetic_audio::{PlaybackSettings, SpriteRegion};
+use std::time::Duration;
+
+let sound = manager.load_sound(include_bytes!("assets/ui-sheet.wav"), "wav")?;
+let sprite = manager.add_sprite(
+    sound,
+    &[
+        SpriteRegion {
+            name: "click",
+            start: Duration::from_millis(0),
+            end: Duration::from_millis(120),
+            looped: false,
+        },
+        SpriteRegion {
+            name: "hover",
+            start: Duration::from_millis(120),
+            end: Duration::from_millis(260),
+            looped: false,
+        },
+    ],
+)?;
+
+let handle = manager.play_sprite(sprite, "click", PlaybackSettings::default())?;
 ```
 
 ## 3D positional audio
 
 ```rust
-use kinetic_audio::{PlaybackSettings, SpatialSettings, DistanceModel};
+use kinetic_audio::{DistanceModel, PlaybackSettings, SpatialSettings};
 use glam::Vec3;
 
-// Place the listener in the world.
-manager.set_listener_position(Vec3::new(0.0, 0.0, 0.0));
-manager.set_listener_orientation(Vec3::Z, Vec3::Y);  // forward, up
+manager.set_listener_position(Vec3::ZERO);
+manager.set_listener_orientation(Vec3::Z, Vec3::Y);
 
-// Play a sound at a world-space position.
-let handle = manager.play(
+let mut handle = manager.play(
     explosion,
     PlaybackSettings {
         spatial: Some(SpatialSettings {
@@ -91,62 +101,42 @@ let handle = manager.play(
     },
 )?;
 
-// Move the source in real-time.
 handle.set_position(Vec3::new(125.0, 0.0, 80.0));
 ```
 
-On native, attenuation and constant-power stereo panning are computed from the listener's frame of reference. On WASM, the browser's `PannerNode` handles both.
-
-## Effects DSP
-
-Effects are working DSP units. Bus-level wiring into the audio callback is not yet complete (see limitations above), but the types are available for standalone use:
-
-```rust
-use kinetic_audio::effects::{BiquadFilter, FilterMode, DelayLine};
-
-// Low-pass filter at 800 Hz.
-let mut lpf = BiquadFilter::new(FilterMode::LowPass, 44_100);
-lpf.cutoff_hz = 800.0;
-lpf.resonance = 0.707;
-lpf.recalc_coefficients();
-
-// Delay with 300 ms time, 40% feedback, 50% wet.
-let mut delay = DelayLine::new(1.0 /* max time */, 44_100);
-delay.time = 0.3;
-delay.feedback = 0.4;
-delay.mix = 0.5;
-```
+On native, `AudioManager` recomputes gain and pan for active spatial voices as the listener or source moves. On WASM, the browser's `PannerNode` handles spatialization.
 
 ## Mixer busses
 
 ```rust
-use kinetic_audio::MixSettings;
+use kinetic_audio::{DelayLine, MixSettings, PlaybackSettings};
 
 let sfx_bus = manager.add_bus(MixSettings {
     name: "sfx".into(),
-    gain: 0.8,
+    gain: 1.0,
     muted: false,
     soloed: false,
 })?;
 
-// Route a sound to the bus.
+manager.add_bus_effect(sfx_bus, Box::new(DelayLine::new(1.0, 44_100)));
+manager.set_bus_volume_db(sfx_bus, -6.0);
+
 let handle = manager.play(
     sound,
-    PlaybackSettings { track: Some(sfx_bus), ..Default::default() },
+    PlaybackSettings {
+        track: Some(sfx_bus),
+        ..Default::default()
+    },
 )?;
-
-// Adjust bus volume in decibels.
-manager.set_bus_volume_db(sfx_bus, -6.0);
 ```
 
-> **Note:** Bus routing is not yet active in the native (cpal) backend; all voices currently mix to master.
+Bus routing, gain, mute, and solo work on both backends. Native `cpal` also runs the Rust DSP effect chain attached with `add_bus_effect()`.
 
-## WASM / browser notes
+## Browser / WASM notes
 
-The Web Audio API requires a user gesture before audio can play. Call `manager.resume()` inside your click/keydown handler:
+Web Audio requires a user gesture before playback can start. Call `resume()` inside your click / key handler:
 
 ```rust
-// In your WASM event handler:
 manager.resume()?;
 ```
 
@@ -154,10 +144,17 @@ manager.resume()?;
 
 | Feature | Default | Description |
 |---------|:-------:|-------------|
-| `cpal-backend` | ✅ | Native audio device via `cpal` |
-| `web-backend` | | Web Audio API backend (WASM targets) |
-| `symphonia` | | OGG / MP3 / FLAC decoders *(reserved — not yet implemented)* |
-| `hrtf` | | HRTF spatial tables *(reserved — not yet implemented)* |
+| `cpal-backend` | ✅ | Native audio output via `cpal` |
+| `web-backend` |  | Marker feature for browser builds; current Web Audio compilation is driven by `target_arch = "wasm32"` rather than this flag |
+| `symphonia` |  | OGG / MP3 / FLAC / AAC decoding |
+| `hrtf` |  | Reserved for future HRTF assets / processing |
+
+`cpal-backend` has the only checkmark because it is the only default feature. `web-backend` is intentionally unchecked: the browser backend works on `wasm32`, but today that support comes from target-specific dependencies and `cfg(target_arch = "wasm32")` code paths, not from the feature flag itself.
+
+## Examples
+
+- `cargo run --example basic_playback`
+- `cargo run --example sprites`
 
 ## Minimum Rust version
 
@@ -165,18 +162,17 @@ manager.resume()?;
 
 ## Architecture
 
-```
-User API  (AudioManager, SoundHandle, SpriteData, …)
-    │
-    ▼
-Backend trait
-    ├── CpalBackend   — native desktop (macOS / Linux / Windows)
-    │     real-time audio thread, mpsc command channel
-    └── WebAudioBackend — browser WASM
-          AudioContext, GainNode, PannerNode, BiquadFilterNode
+```text
+AudioManager / SoundHandle / SpriteData
+                │
+                ▼
+            Backend trait
+         ┌────────┴────────┐
+         ▼                 ▼
+    CpalBackend      WebAudioBackend
 ```
 
-`DefaultBackend` resolves to `CpalBackend` on native and `WebAudioBackend` on WASM, so most crates can write `AudioManager::<DefaultBackend>::new(…)` and compile unchanged on both targets.
+`DefaultBackend` resolves to `CpalBackend` on native and `WebAudioBackend` on `wasm32`, so most game code can compile unchanged on both targets.
 
 ## License
 

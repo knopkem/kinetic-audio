@@ -29,8 +29,6 @@ pub struct SpriteRegion {
 pub struct SpriteData {
     /// Underlying buffer.
     pub(crate) sound: SoundKey,
-    /// Sample rate of the buffer.
-    pub(crate) sample_rate: u32,
     /// Named regions.
     pub(crate) regions: Vec<SpriteDef>,
 }
@@ -58,13 +56,12 @@ impl SpriteData {
             .collect();
         Self {
             sound,
-            sample_rate,
             regions: defs,
         }
     }
 
     /// Resolve a region by name.
-    pub fn region(&self, name: &str) -> Option<&SpriteDef> {
+    pub(crate) fn region(&self, name: &str) -> Option<&SpriteDef> {
         self.regions.iter().find(|r| r.name == name)
     }
 
@@ -73,6 +70,7 @@ impl SpriteData {
         self.regions.len()
     }
 
+    /// Whether no regions have been defined.
     pub fn is_empty(&self) -> bool {
         self.regions.is_empty()
     }
@@ -86,8 +84,18 @@ pub struct SpriteHandle {
 }
 
 impl SpriteHandle {
+    /// Sprite sheet key referenced by this handle.
+    pub fn sprite_key(&self) -> SpriteKey {
+        self.sprite
+    }
+
     /// Name of the region this handle targets.
     pub fn region_name(&self) -> &str {
         &self.region
+    }
+
+    /// Playback settings that will be applied when the region is played.
+    pub fn playback_settings(&self) -> &PlaybackSettings {
+        &self.settings
     }
 }
