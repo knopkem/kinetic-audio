@@ -433,7 +433,11 @@ impl Backend for WebAudioBackend {
                         (v.scheduled_start_time - now) + cycle_secs
                     } else {
                         let phase = offset / playback_rate;
-                        if phase == 0.0 { cycle_secs } else { cycle_secs - phase }
+                        if phase == 0.0 {
+                            cycle_secs
+                        } else {
+                            cycle_secs - phase
+                        }
                     };
                     let _ = scheduled_source(&v.source).stop_with_when(now + remaining.max(0.0));
                 }
@@ -543,9 +547,7 @@ impl Backend for WebAudioBackend {
         if let Some(bus) = self.buses.get_mut(&id) {
             bus.linear_gain = gain;
             bus.muted = muted;
-            bus.gain
-                .gain()
-                .set_value(if muted { 0.0 } else { gain });
+            bus.gain.gain().set_value(if muted { 0.0 } else { gain });
         }
     }
 }

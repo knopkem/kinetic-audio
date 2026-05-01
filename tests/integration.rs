@@ -1,11 +1,10 @@
 //! Integration tests using `NullBackend` (no real audio device required).
 
-use kinetic_audio::{
-    AudioConfig, AudioManager, MixSettings, PlaybackSettings, SpriteRegion,
-    Tween, Easing,
-};
 use kinetic_audio::backend::null::NullBackend;
 use kinetic_audio::effects::delay::DelayLine;
+use kinetic_audio::{
+    AudioConfig, AudioManager, Easing, MixSettings, PlaybackSettings, SpriteRegion, Tween,
+};
 use std::time::Duration;
 
 // ── helpers ──────────────────────────────────────────────────────────────────
@@ -24,13 +23,13 @@ fn make_wav(n_frames: u16) -> Vec<u8> {
 
     // fmt chunk (PCM, 1 ch, 44100 Hz, 16-bit)
     w.extend_from_slice(b"fmt ");
-    w.extend_from_slice(&16u32.to_le_bytes());   // chunk size
-    w.extend_from_slice(&1u16.to_le_bytes());    // PCM
-    w.extend_from_slice(&1u16.to_le_bytes());    // channels
+    w.extend_from_slice(&16u32.to_le_bytes()); // chunk size
+    w.extend_from_slice(&1u16.to_le_bytes()); // PCM
+    w.extend_from_slice(&1u16.to_le_bytes()); // channels
     w.extend_from_slice(&44_100u32.to_le_bytes()); // sample rate
     w.extend_from_slice(&(44_100u32 * 2).to_le_bytes()); // byte rate
-    w.extend_from_slice(&2u16.to_le_bytes());    // block align
-    w.extend_from_slice(&16u16.to_le_bytes());   // bits per sample
+    w.extend_from_slice(&2u16.to_le_bytes()); // block align
+    w.extend_from_slice(&16u16.to_le_bytes()); // bits per sample
 
     // data chunk
     w.extend_from_slice(b"data");
@@ -52,7 +51,9 @@ fn load_and_play_wav() {
     let bytes = make_wav(100);
     let mut m = null_manager();
     let key = m.load_sound(&bytes, "wav").expect("load failed");
-    let handle = m.play(key, PlaybackSettings::default()).expect("play failed");
+    let handle = m
+        .play(key, PlaybackSettings::default())
+        .expect("play failed");
     // Voice should be live before any update.
     assert!(!m.is_finished(&handle));
 }
@@ -62,7 +63,9 @@ fn stop_voice_immediately() {
     let bytes = make_wav(100);
     let mut m = null_manager();
     let key = m.load_sound(&bytes, "wav").expect("load failed");
-    let handle = m.play(key, PlaybackSettings::default()).expect("play failed");
+    let handle = m
+        .play(key, PlaybackSettings::default())
+        .expect("play failed");
     handle.stop();
     // After update the manager processes the Stop command.
     m.update(Duration::from_millis(16));
@@ -73,7 +76,9 @@ fn pause_resume_and_position_tracking_work() {
     let bytes = make_wav(10_000);
     let mut m = null_manager();
     let key = m.load_sound(&bytes, "wav").expect("load failed");
-    let handle = m.play(key, PlaybackSettings::default()).expect("play failed");
+    let handle = m
+        .play(key, PlaybackSettings::default())
+        .expect("play failed");
 
     m.update(Duration::from_millis(100));
     let before_pause = m.playback_position(&handle).expect("position missing");
@@ -97,7 +102,9 @@ fn seek_controls_position() {
     let bytes = make_wav(10_000);
     let mut m = null_manager();
     let key = m.load_sound(&bytes, "wav").expect("load failed");
-    let handle = m.play(key, PlaybackSettings::default()).expect("play failed");
+    let handle = m
+        .play(key, PlaybackSettings::default())
+        .expect("play failed");
 
     handle.seek_to(Duration::from_millis(150));
     m.update(Duration::ZERO);
@@ -119,7 +126,9 @@ fn fade_volume_tween_advances() {
     let bytes = make_wav(100);
     let mut m = null_manager();
     let key = m.load_sound(&bytes, "wav").expect("load failed");
-    let mut handle = m.play(key, PlaybackSettings::default()).expect("play failed");
+    let mut handle = m
+        .play(key, PlaybackSettings::default())
+        .expect("play failed");
 
     let tween = Tween {
         duration: Duration::from_millis(100),
@@ -138,7 +147,9 @@ fn fade_pan_tween_advances() {
     let bytes = make_wav(100);
     let mut m = null_manager();
     let key = m.load_sound(&bytes, "wav").expect("load failed");
-    let mut handle = m.play(key, PlaybackSettings::default()).expect("play failed");
+    let mut handle = m
+        .play(key, PlaybackSettings::default())
+        .expect("play failed");
 
     let tween = Tween {
         duration: Duration::from_millis(50),
@@ -158,13 +169,18 @@ fn fade_out_marks_voice_finished() {
     let bytes = make_wav(100);
     let mut m = null_manager();
     let key = m.load_sound(&bytes, "wav").expect("load failed");
-    let handle = m.play(key, PlaybackSettings::default()).expect("play failed");
+    let handle = m
+        .play(key, PlaybackSettings::default())
+        .expect("play failed");
 
     handle.fade_out(Duration::from_millis(50));
 
     // The NullBackend marks voices finished immediately on FadeOut.
     m.update(Duration::from_millis(16));
-    assert!(m.is_finished(&handle), "voice should be finished after fade-out");
+    assert!(
+        m.is_finished(&handle),
+        "voice should be finished after fade-out"
+    );
 }
 
 #[test]
@@ -172,10 +188,15 @@ fn stop_after_loop_sends_command() {
     let bytes = make_wav(100);
     let mut m = null_manager();
     let key = m.load_sound(&bytes, "wav").expect("load failed");
-    let handle = m.play(
-        key,
-        PlaybackSettings { looped: true, ..Default::default() },
-    ).expect("play failed");
+    let handle = m
+        .play(
+            key,
+            PlaybackSettings {
+                looped: true,
+                ..Default::default()
+            },
+        )
+        .expect("play failed");
 
     handle.stop_after_loop();
     m.update(Duration::from_millis(16));
@@ -207,8 +228,12 @@ fn sprite_regions_play_correctly() {
     ];
     let sprite = m.add_sprite(sound, &regions).expect("add_sprite failed");
 
-    let ha = m.play_sprite(sprite, "a", PlaybackSettings::default()).expect("play a");
-    let hb = m.play_sprite(sprite, "b", PlaybackSettings::default()).expect("play b");
+    let ha = m
+        .play_sprite(sprite, "a", PlaybackSettings::default())
+        .expect("play a");
+    let hb = m
+        .play_sprite(sprite, "b", PlaybackSettings::default())
+        .expect("play b");
 
     // Both handles are live.
     assert!(!m.is_finished(&ha));
@@ -342,7 +367,9 @@ fn finished_set_populated_by_update() {
     let key = m.load_sound(&bytes, "wav").expect("load failed");
 
     // NullBackend finishes voices when `finished` flag is set via FadeOut.
-    let handle = m.play(key, PlaybackSettings::default()).expect("play failed");
+    let handle = m
+        .play(key, PlaybackSettings::default())
+        .expect("play failed");
     handle.fade_out(Duration::ZERO);
 
     m.update(Duration::from_millis(16));

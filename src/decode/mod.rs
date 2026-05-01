@@ -8,9 +8,9 @@ pub mod wav;
 #[cfg(feature = "symphonia")]
 pub mod symphonia;
 
-pub use self::wav::decode_wav;
 #[cfg(feature = "symphonia")]
 pub use self::symphonia::decode_symphonia;
+pub use self::wav::decode_wav;
 
 /// Generic decode error.
 #[derive(Debug, thiserror::Error)]

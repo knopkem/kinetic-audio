@@ -145,7 +145,11 @@ impl<B: Backend> AudioManager<B> {
     /// Decode an audio byte slice and return a key.
     ///
     /// `hint` should be the file extension (e.g. `"wav"`, `"ogg"`, `"mp3"`).
-    pub fn load_sound(&mut self, bytes: &[u8], hint: &str) -> Result<SoundKey, crate::backend::AudioError> {
+    pub fn load_sound(
+        &mut self,
+        bytes: &[u8],
+        hint: &str,
+    ) -> Result<SoundKey, crate::backend::AudioError> {
         let (frames, rate) = crate::decode::decode(bytes, hint)
             .map_err(|e| crate::backend::AudioError::Decode(e.to_string()))?;
         let n_frames = frames.len();
@@ -169,7 +173,11 @@ impl<B: Backend> AudioManager<B> {
     /// Register named regions over an already-loaded [`SoundKey`].
     ///
     /// Returns a [`SpriteKey`] that can be passed to [`play_sprite`](Self::play_sprite).
-    pub fn add_sprite(&mut self, sound: SoundKey, regions: &[SpriteRegion]) -> Result<SpriteKey, crate::backend::AudioError> {
+    pub fn add_sprite(
+        &mut self,
+        sound: SoundKey,
+        regions: &[SpriteRegion],
+    ) -> Result<SpriteKey, crate::backend::AudioError> {
         let rate = self
             .sounds
             .get(sound)
@@ -192,9 +200,9 @@ impl<B: Backend> AudioManager<B> {
             .sprites
             .get(sprite)
             .ok_or(crate::backend::AudioError::InvalidHandle)?;
-        let region = sprite_data
-            .region(region_name)
-            .ok_or_else(|| crate::backend::AudioError::Backend(format!("unknown sprite region: {region_name}")))?;
+        let region = sprite_data.region(region_name).ok_or_else(|| {
+            crate::backend::AudioError::Backend(format!("unknown sprite region: {region_name}"))
+        })?;
 
         let start = region.start_sample;
         let end = region.end_sample;
@@ -249,7 +257,13 @@ impl<B: Backend> AudioManager<B> {
             },
         );
         let bridge = self.make_bridge();
-        Ok(SoundHandle { voice, manager: bridge, volume, pan, rate: settings.rate })
+        Ok(SoundHandle {
+            voice,
+            manager: bridge,
+            volume,
+            pan,
+            rate: settings.rate,
+        })
     }
 
     /// Upload pre-decoded interleaved stereo samples directly.
@@ -471,26 +485,26 @@ impl<B: Backend> AudioManager<B> {
         self.active_tweens = active_tweens
             .drain(..)
             .filter_map(|mut tw| {
-            tw.elapsed_secs += dt_secs;
-            let t = tw.tween.sample(tw.elapsed_secs);
-            let val = tw.start_val + (tw.end_val - tw.start_val) * t;
-            if let Some(state) = self.voice_states.get_mut(&tw.voice) {
-                match tw.target {
-                    TweenTarget::Volume => state.base_volume = val,
-                    TweenTarget::Pan => state.base_pan = val,
+                tw.elapsed_secs += dt_secs;
+                let t = tw.tween.sample(tw.elapsed_secs);
+                let val = tw.start_val + (tw.end_val - tw.start_val) * t;
+                if let Some(state) = self.voice_states.get_mut(&tw.voice) {
+                    match tw.target {
+                        TweenTarget::Volume => state.base_volume = val,
+                        TweenTarget::Pan => state.base_pan = val,
+                    }
+                    self.refresh_voice_mix(tw.voice);
+                } else {
+                    let param = match tw.target {
+                        TweenTarget::Volume => VoiceParam::Volume(val),
+                        TweenTarget::Pan => VoiceParam::Pan(val),
+                    };
+                    self.backend.set_param(tw.voice, param);
                 }
-                self.refresh_voice_mix(tw.voice);
-            } else {
-                let param = match tw.target {
-                    TweenTarget::Volume => VoiceParam::Volume(val),
-                    TweenTarget::Pan => VoiceParam::Pan(val),
-                };
-                self.backend.set_param(tw.voice, param);
-            }
-            // Keep tween until it has fully reached its end.
-            (tw.elapsed_secs < tw.tween.duration.as_secs_f32()).then_some(tw)
-        })
-        .collect();
+                // Keep tween until it has fully reached its end.
+                (tw.elapsed_secs < tw.tween.duration.as_secs_f32()).then_some(tw)
+            })
+            .collect();
 
         self.backend.tick(dt);
         for id in self.backend.finished_voices() {
@@ -635,8 +649,7 @@ impl<B: Backend> AudioManager<B> {
             .buses
             .iter()
             .map(|(id, bus)| {
-                let effective_muted =
-                    bus.settings.muted || (any_soloed && !bus.settings.soloed);
+                let effective_muted = bus.settings.muted || (any_soloed && !bus.settings.soloed);
                 (id, bus.settings.gain, effective_muted)
             })
             .collect();
@@ -714,7 +727,10 @@ impl<B: Backend> AudioManager<B> {
                         .active_tweens
                         .iter()
                         .rfind(|tw| tw.voice == voice && tw.target == TweenTarget::Volume)
-                        .map(|tw| tw.start_val + (tw.end_val - tw.start_val) * tw.tween.sample(tw.elapsed_secs))
+                        .map(|tw| {
+                            tw.start_val
+                                + (tw.end_val - tw.start_val) * tw.tween.sample(tw.elapsed_secs)
+                        })
                         .or_else(|| self.voice_states.get(&voice).map(|s| s.base_volume))
                         .unwrap_or(0.0);
                     self.active_tweens
@@ -744,7 +760,10 @@ impl<B: Backend> AudioManager<B> {
                         .active_tweens
                         .iter()
                         .rfind(|tw| tw.voice == voice && tw.target == TweenTarget::Pan)
-                        .map(|tw| tw.start_val + (tw.end_val - tw.start_val) * tw.tween.sample(tw.elapsed_secs))
+                        .map(|tw| {
+                            tw.start_val
+                                + (tw.end_val - tw.start_val) * tw.tween.sample(tw.elapsed_secs)
+                        })
                         .or_else(|| self.voice_states.get(&voice).map(|s| s.base_pan))
                         .unwrap_or(0.0);
                     self.active_tweens
@@ -910,7 +929,13 @@ mod tests {
             )
             .unwrap();
 
-        let initial_pan = manager.backend.voices.get(handle.voice).unwrap().settings.pan;
+        let initial_pan = manager
+            .backend
+            .voices
+            .get(handle.voice)
+            .unwrap()
+            .settings
+            .pan;
         manager.set_listener_position(Vec3::new(50.0, 0.0, 0.0));
         let voice = manager.backend.voices.get(handle.voice).unwrap();
 

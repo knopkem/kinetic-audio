@@ -6,8 +6,8 @@
 //! Run with:
 //!   cargo run --example basic_playback
 
-use kinetic_audio::{AudioConfig, AudioManager, PlaybackSettings};
 use kinetic_audio::backend::cpal::CpalBackend;
+use kinetic_audio::{AudioConfig, AudioManager, PlaybackSettings};
 use std::time::Duration;
 
 fn main() {

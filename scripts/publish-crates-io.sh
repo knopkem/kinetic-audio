@@ -48,6 +48,9 @@ if [[ $allow_dirty -eq 1 ]]; then
   publish_args+=(--allow-dirty)
 fi
 
+echo "==> cargo fmt --all -- --check"
+cargo fmt --all -- --check
+
 echo "==> cargo test"
 cargo test
 

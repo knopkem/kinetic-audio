@@ -6,8 +6,8 @@
 //! Run with:
 //!   cargo run --example sprites
 
-use kinetic_audio::{AudioConfig, AudioManager, PlaybackSettings, SpriteRegion};
 use kinetic_audio::backend::cpal::CpalBackend;
+use kinetic_audio::{AudioConfig, AudioManager, PlaybackSettings, SpriteRegion};
 use std::time::Duration;
 
 // Sprite sheet layout (milliseconds):

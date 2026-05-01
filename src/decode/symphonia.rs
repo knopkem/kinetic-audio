@@ -81,22 +81,16 @@ pub fn decode_symphonia(bytes: &[u8]) -> Result<(Vec<Frame>, u32), DecodeError> 
                 append_generic(&buf, &mut frames, |s| s as f32 / i8::MAX as f32);
             }
             AudioBufferRef::U8(buf) => {
-                append_generic(&buf, &mut frames, |s| {
-                    (s as f32 - 128.0) / 128.0
-                });
+                append_generic(&buf, &mut frames, |s| (s as f32 - 128.0) / 128.0);
             }
             AudioBufferRef::S16(buf) => {
                 append_generic(&buf, &mut frames, |s| s as f32 / i16::MAX as f32);
             }
             AudioBufferRef::U16(buf) => {
-                append_generic(&buf, &mut frames, |s| {
-                    (s as f32 - 32768.0) / 32768.0
-                });
+                append_generic(&buf, &mut frames, |s| (s as f32 - 32768.0) / 32768.0);
             }
             AudioBufferRef::S24(buf) => {
-                append_generic(&buf, &mut frames, |s| {
-                    s.0 as f32 / 8_388_608.0
-                });
+                append_generic(&buf, &mut frames, |s| s.0 as f32 / 8_388_608.0);
             }
             AudioBufferRef::U24(buf) => {
                 append_generic(&buf, &mut frames, |s| {
@@ -162,7 +156,10 @@ fn append_generic<S, F>(
             let l = &plane_data[0][..n];
             let r = &plane_data[1][..n];
             for i in 0..n {
-                frames.push(Frame { l: convert(l[i]), r: convert(r[i]) });
+                frames.push(Frame {
+                    l: convert(l[i]),
+                    r: convert(r[i]),
+                });
             }
         }
     }

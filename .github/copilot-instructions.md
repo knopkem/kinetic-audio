@@ -8,6 +8,7 @@ Generated changes should preserve the crate's cross-platform API and keep behavi
 ## CI Readiness
 
 - Before handing work off, use the local commands that represent the supported targets and feature sets:
+  - `cargo fmt --all -- --check`
   - `cargo test`
   - `cargo clippy --all-targets --all-features`
   - `cargo build --features symphonia`
