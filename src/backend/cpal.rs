@@ -162,23 +162,58 @@ impl Backend for CpalBackend {
             .map_err(|e| AudioError::DeviceUnavailable(e.to_string()))?
             .collect();
 
-        let range = *configs
-            .iter()
-            .find(|c| c.sample_format() == cpal::SampleFormat::F32 && c.channels() == 2)
-            .or_else(|| {
+        let default_sample_rate = device
+            .default_output_config()
+            .ok()
+            .map(|config| config.sample_rate().0);
+        let range_supporting = |rate: u32| {
+            configs
+                .iter()
+                .find(|c| {
+                    c.sample_format() == cpal::SampleFormat::F32
+                        && c.channels() == 2
+                        && (c.min_sample_rate().0..=c.max_sample_rate().0).contains(&rate)
+                })
+                .or_else(|| {
+                    configs.iter().find(|c| {
+                        c.sample_format() == cpal::SampleFormat::F32
+                            && (c.min_sample_rate().0..=c.max_sample_rate().0).contains(&rate)
+                    })
+                })
+                .or_else(|| {
+                    configs
+                        .iter()
+                        .find(|c| (c.min_sample_rate().0..=c.max_sample_rate().0).contains(&rate))
+                })
+                .copied()
+        };
+
+        let (range, sample_rate) = if _config.sample_rate == 0 {
+            [48_000, 44_100]
+                .into_iter()
+                .chain(default_sample_rate)
+                .find_map(|rate| range_supporting(rate).map(|range| (range, rate)))
+                .ok_or_else(|| AudioError::DeviceUnavailable("no supported stream config".into()))?
+        } else {
+            let range = range_supporting(_config.sample_rate).or_else(|| {
                 configs
                     .iter()
-                    .find(|c| c.sample_format() == cpal::SampleFormat::F32)
-            })
-            .or_else(|| configs.first())
-            .ok_or_else(|| AudioError::DeviceUnavailable("no supported stream config".into()))?;
-
-        let sample_rate = if _config.sample_rate == 0 {
-            range.min_sample_rate().0
-        } else {
-            _config
+                    .find(|c| c.sample_format() == cpal::SampleFormat::F32 && c.channels() == 2)
+                    .or_else(|| {
+                        configs
+                            .iter()
+                            .find(|c| c.sample_format() == cpal::SampleFormat::F32)
+                    })
+                    .or_else(|| configs.first())
+                    .copied()
+            });
+            let range = range.ok_or_else(|| {
+                AudioError::DeviceUnavailable("no supported stream config".into())
+            })?;
+            let sample_rate = _config
                 .sample_rate
-                .clamp(range.min_sample_rate().0, range.max_sample_rate().0)
+                .clamp(range.min_sample_rate().0, range.max_sample_rate().0);
+            (range, sample_rate)
         };
 
         let stream_config = range
