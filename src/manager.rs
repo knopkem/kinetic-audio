@@ -51,7 +51,6 @@ struct ManagedVoiceState {
     paused: bool,
     delay_remaining_secs: f64,
     spatial: Option<SpatialSettings>,
-    spatialized_once: bool,
 }
 
 /// Configuration passed to `AudioManager::new()`.
@@ -253,7 +252,6 @@ impl<B: Backend> AudioManager<B> {
                 paused: false,
                 delay_remaining_secs: settings.delay.as_secs_f64(),
                 spatial,
-                spatialized_once: spatial.is_some(),
             },
         );
         let bridge = self.make_bridge();
@@ -332,7 +330,6 @@ impl<B: Backend> AudioManager<B> {
                 paused: false,
                 delay_remaining_secs: settings.delay.as_secs_f64(),
                 spatial,
-                spatialized_once: spatial.is_some(),
             },
         );
 
@@ -627,13 +624,14 @@ impl<B: Backend> AudioManager<B> {
         self.backend.set_param(voice, VoiceParam::Volume(volume));
         self.backend.set_param(voice, VoiceParam::Pan(pan));
 
-        if let Some(spatial) = state.spatial {
-            self.backend
-                .set_param(voice, VoiceParam::Position(spatial.position));
-        } else if state.spatialized_once {
-            self.backend
-                .set_param(voice, VoiceParam::Position(self.listener.position));
-        }
+        // Web Audio keeps a panner on every voice so `set_position` can make it
+        // spatial later. Non-spatial voices must follow the listener; otherwise
+        // moving the listener applies distance attenuation to music and UI audio.
+        let position = state
+            .spatial
+            .map_or(self.listener.position, |spatial| spatial.position);
+        self.backend
+            .set_param(voice, VoiceParam::Position(position));
     }
 
     fn refresh_spatial_voices(&mut self) {
@@ -700,7 +698,6 @@ impl<B: Backend> AudioManager<B> {
                             let mut spatial = state.spatial.unwrap_or_default();
                             spatial.position = pos;
                             state.spatial = Some(spatial);
-                            state.spatialized_once = true;
                         }
                         None => {
                             state.spatial = None;
@@ -860,6 +857,7 @@ mod tests {
 
     use super::AudioManager;
     use crate::backend::null::{BackendLog, NullBackend};
+    use crate::backend::VoiceParam;
     use crate::math::Frame;
     use crate::sound::PlaybackSettings;
     use crate::spatial::{DistanceModel, SpatialSettings, Vec3};
@@ -987,6 +985,28 @@ mod tests {
         let voice = manager.backend.voices.get(handle.voice).unwrap();
         assert!((voice.settings.volume - 0.8).abs() < 1e-4);
         assert!((voice.settings.pan + 0.25).abs() < 1e-4);
+    }
+
+    #[test]
+    fn non_spatial_voice_follows_the_listener() {
+        let mut manager = AudioManager::<NullBackend>::new(Default::default()).unwrap();
+        let key = manager.load_raw(Arc::new(vec![Frame::mono(0.25); 32]), 44_100);
+        manager.play(key, PlaybackSettings::default()).unwrap();
+
+        let listener = Vec3::new(100.0, 20.0, -40.0);
+        manager.set_listener_position(listener);
+
+        let expected = BackendLog::SetParam(
+            manager
+                .backend
+                .voices
+                .iter()
+                .next()
+                .expect("played voice exists")
+                .0,
+            format!("{:?}", VoiceParam::Position(listener)),
+        );
+        assert!(manager.backend.log.contains(&expected));
     }
 
     #[test]
