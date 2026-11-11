@@ -3,6 +3,10 @@
 //! Runs natively on desktop (via `cpal`) and in the browser
 //! (via the Web Audio API). A unified API drives both.
 //!
+//! Source audio may be authored at any sample rate: buffers are converted to
+//! the output device rate on load (see [`resample`]). Decoded audio is held in
+//! memory until released with [`AudioManager::unload_sound`].
+//!
 //! ```ignore
 //! use kinetic_audio::{AudioManager, DefaultBackend, AudioConfig};
 //!
@@ -18,6 +22,7 @@ pub mod decode;
 pub mod effects;
 pub mod math;
 pub mod mixer;
+pub mod resample;
 pub mod spatial;
 pub mod sprite;
 pub mod tween;

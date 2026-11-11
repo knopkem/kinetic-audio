@@ -67,7 +67,7 @@ pub struct AudioConfig {
 impl Default for AudioConfig {
     fn default() -> Self {
         Self {
-            sample_rate: 44_100, // Match common source material; cpal will pick closest supported.
+            sample_rate: 44_100, // Match common source material; other rates are resampled on load.
             max_voices: 256,
             buffer_size: 512,
         }
@@ -144,6 +144,11 @@ impl<B: Backend> AudioManager<B> {
     /// Decode an audio byte slice and return a key.
     ///
     /// `hint` should be the file extension (e.g. `"wav"`, `"ogg"`, `"mp3"`).
+    ///
+    /// Buffers whose source rate differs from the output device rate are
+    /// converted to the device rate here, so playback pitch and duration stay
+    /// correct and [`SoundData::sample_rate`] always reports the rate the audio
+    /// is played at.
     pub fn load_sound(
         &mut self,
         bytes: &[u8],
@@ -151,17 +156,7 @@ impl<B: Backend> AudioManager<B> {
     ) -> Result<SoundKey, crate::backend::AudioError> {
         let (frames, rate) = crate::decode::decode(bytes, hint)
             .map_err(|e| crate::backend::AudioError::Decode(e.to_string()))?;
-        let n_frames = frames.len();
-        let samples = Arc::new(frames);
-        let handle = self.backend.upload_buffer(samples.clone(), rate);
-        let key = self.sounds.insert(SoundData {
-            buffer: handle,
-            samples,
-            sample_rate: rate,
-            duration: samples_to_duration(n_frames, rate),
-            channels: 2,
-        });
-        Ok(key)
+        Ok(self.install_samples(frames, rate))
     }
 
     /// Decode a WAV byte slice as a sprite sheet.
@@ -267,14 +262,65 @@ impl<B: Backend> AudioManager<B> {
     /// Upload pre-decoded interleaved stereo samples directly.
     ///
     /// This bypasses the decoder and is useful for procedural / runtime-generated audio.
+    /// Like [`load_sound`](Self::load_sound), audio that does not already match the
+    /// output device rate is converted first.
     pub fn load_raw(&mut self, samples: Arc<Vec<Frame>>, rate: u32) -> SoundKey {
+        if rate == self.backend.sample_rate() {
+            return self.install_samples_arc(samples, rate);
+        }
+        self.install_samples((*samples).clone(), rate)
+    }
+
+    /// Unload a previously loaded sound and release its samples.
+    ///
+    /// Returns `true` when the key was still loaded. Sprites registered over the
+    /// sound are removed with it, because their regions describe slices of audio
+    /// that is going away.
+    ///
+    /// Playback is not interrupted: samples are reference counted, so voices
+    /// started before this call keep sounding and the memory is reclaimed when
+    /// the last of them stops. A [`SoundKey`] you kept for an unloaded sound must
+    /// not be reused — [`play`](Self::play) answers [`AudioError::InvalidHandle`]
+    /// — and slotmap may hand the key to a later sound.
+    pub fn unload_sound(&mut self, key: SoundKey) -> bool {
+        let Some(sound) = self.sounds.remove(key) else {
+            return false;
+        };
+        self.backend.release_buffer(sound.buffer);
+        self.sprites.retain(|_, sprite| sprite.sound != key);
+        true
+    }
+
+    /// Store decoded frames as a sound, converting them to the device rate.
+    fn install_samples(&mut self, frames: Vec<Frame>, rate: u32) -> SoundKey {
+        self.install_samples_arc(Arc::new(frames), rate)
+    }
+
+    fn install_samples_arc(&mut self, samples: Arc<Vec<Frame>>, rate: u32) -> SoundKey {
+        let device_rate = self.backend.sample_rate();
+        let (samples, sample_rate) = if rate != device_rate {
+            log::debug!(
+                "kinetic-audio: converting {} frames from {rate} Hz to {device_rate} Hz",
+                samples.len()
+            );
+            (
+                Arc::new(crate::resample::resample_frames(
+                    &samples,
+                    rate,
+                    device_rate,
+                )),
+                device_rate,
+            )
+        } else {
+            (samples, rate)
+        };
         let n_samples = samples.len();
-        let handle = self.backend.upload_buffer(samples.clone(), rate);
+        let handle = self.backend.upload_buffer(samples.clone(), sample_rate);
         self.sounds.insert(SoundData {
             buffer: handle,
             samples,
-            sample_rate: rate,
-            duration: samples_to_duration(n_samples, rate),
+            sample_rate,
+            duration: samples_to_duration(n_samples, sample_rate),
             channels: 2,
         })
     }

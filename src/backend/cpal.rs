@@ -221,6 +221,12 @@ impl Backend for CpalBackend {
             .config();
         let channels = stream_config.channels as usize;
         let actual_rate = stream_config.sample_rate.0;
+        if _config.sample_rate != 0 && actual_rate != _config.sample_rate {
+            log::warn!(
+                "cpal: requested sample rate {} Hz is unsupported by this device; opening at {actual_rate} Hz. Buffers are resampled to the device rate on load.",
+                _config.sample_rate
+            );
+        }
 
         let (tx, rx) = sync_channel::<AudioCommand>(COMMAND_QUEUE_CAP);
         let (finished_tx, finished_rx) = sync_channel::<VoiceId>(MAX_VOICES * 2);
@@ -448,7 +454,18 @@ impl Backend for CpalBackend {
     fn stop(&mut self) {}
 
     fn upload_buffer(&mut self, samples: Arc<Vec<Frame>>, _rate: u32) -> BufferHandle {
+        debug_assert_eq!(
+            _rate, self.sample_rate,
+            "buffer rate {} does not match device rate {}",
+            _rate, self.sample_rate
+        );
         self.buffers.insert(samples)
+    }
+
+    fn release_buffer(&mut self, handle: BufferHandle) {
+        // Voices keep an Arc clone of the samples, so audio still in flight
+        // finishes cleanly; this only drops the backend's own reference.
+        self.buffers.remove(handle);
     }
 
     fn play(

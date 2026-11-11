@@ -126,7 +126,22 @@ pub trait Backend {
     fn stop(&mut self);
 
     /// Upload decoded samples to the backend.
+    ///
+    /// `rate` is the sample rate of `samples`. Backends play buffers at the
+    /// device rate, so callers are expected to hand over audio already converted
+    /// to [`Backend::sample_rate`] (see [`AudioManager::load_sound`]).
+    ///
+    /// [`AudioManager::load_sound`]: crate::manager::AudioManager::load_sound
     fn upload_buffer(&mut self, samples: Arc<Vec<Frame>>, rate: u32) -> BufferHandle;
+
+    /// Release an uploaded buffer.
+    ///
+    /// Implementations should forget the buffer so its samples can be freed.
+    /// Audio is reference counted, so a buffer still referenced by playing
+    /// voices keeps sounding until the last of them stops; only then is the
+    /// memory reclaimed. After this call the handle must not be played again —
+    /// [`Backend::play`] returns [`AudioError::InvalidHandle`] for it.
+    fn release_buffer(&mut self, _handle: BufferHandle) {}
 
     /// Play a buffer. Returns a [`VoiceId`] for later control.
     fn play(

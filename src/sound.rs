@@ -39,7 +39,12 @@ impl SoundData {
         self.duration
     }
 
-    /// Sample rate.
+    /// Sample rate the audio is played at.
+    ///
+    /// Audio whose source rate differs from the output device rate is converted
+    /// on load, so this always matches [`Backend::sample_rate`].
+    ///
+    /// [`Backend::sample_rate`]: crate::backend::Backend::sample_rate
     pub fn sample_rate(&self) -> u32 {
         self.sample_rate
     }

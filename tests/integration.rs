@@ -1,16 +1,23 @@
 //! Integration tests using `NullBackend` (no real audio device required).
 
-use kinetic_audio::backend::null::NullBackend;
+use kinetic_audio::backend::null::{BackendLog, NullBackend};
 use kinetic_audio::effects::delay::DelayLine;
 use kinetic_audio::{
-    AudioConfig, AudioManager, Easing, MixSettings, PlaybackSettings, SpriteRegion, Tween,
+    AudioConfig, AudioManager, BufferHandle, Easing, Frame, MixSettings, PlaybackSettings,
+    SpriteRegion, Tween,
 };
+use std::sync::Arc;
 use std::time::Duration;
 
 // ── helpers ──────────────────────────────────────────────────────────────────
 
 /// Build a minimal 16-bit mono WAV byte vector at 44 100 Hz, `n_frames` long.
 fn make_wav(n_frames: u16) -> Vec<u8> {
+    make_wav_at(n_frames, 44_100)
+}
+
+/// Build a minimal 16-bit mono WAV byte vector at `sample_rate`, `n_frames` long.
+fn make_wav_at(n_frames: u16, sample_rate: u32) -> Vec<u8> {
     // WAV format: RIFF header + fmt chunk + data chunk.
     let data_len = n_frames as u32 * 2; // 1 channel × 2 bytes per sample
     let riff_len = 36 + data_len;
@@ -21,13 +28,13 @@ fn make_wav(n_frames: u16) -> Vec<u8> {
     w.extend_from_slice(&riff_len.to_le_bytes());
     w.extend_from_slice(b"WAVE");
 
-    // fmt chunk (PCM, 1 ch, 44100 Hz, 16-bit)
+    // fmt chunk (PCM, 1 ch, `sample_rate`, 16-bit)
     w.extend_from_slice(b"fmt ");
     w.extend_from_slice(&16u32.to_le_bytes()); // chunk size
     w.extend_from_slice(&1u16.to_le_bytes()); // PCM
     w.extend_from_slice(&1u16.to_le_bytes()); // channels
-    w.extend_from_slice(&44_100u32.to_le_bytes()); // sample rate
-    w.extend_from_slice(&(44_100u32 * 2).to_le_bytes()); // byte rate
+    w.extend_from_slice(&sample_rate.to_le_bytes()); // sample rate
+    w.extend_from_slice(&(sample_rate * 2).to_le_bytes()); // byte rate
     w.extend_from_slice(&2u16.to_le_bytes()); // block align
     w.extend_from_slice(&16u16.to_le_bytes()); // bits per sample
 
@@ -374,4 +381,140 @@ fn finished_set_populated_by_update() {
 
     m.update(Duration::from_millis(16));
     assert!(m.is_finished(&handle));
+}
+
+// ── sample-rate conversion ────────────────────────────────────────────────────
+
+#[test]
+fn load_converts_source_audio_to_the_device_rate() {
+    // 0.1 s of audio at 32 kHz loaded into a 44.1 kHz device.
+    let bytes = make_wav_at(3_200, 32_000);
+    let mut m = null_manager();
+    let key = m.load_sound(&bytes, "wav").expect("load failed");
+
+    let sound = m.get_sound(key).expect("sound should be loaded");
+    assert_eq!(sound.sample_rate(), 44_100);
+    let expected = (3_200.0 * 44_100.0 / 32_000.0) as i64;
+    let len = sound.len_samples() as i64;
+    assert!(
+        (len - expected).abs() <= 1,
+        "resampled length {len}, expected ~{expected}"
+    );
+    let secs = sound.duration().as_secs_f64();
+    assert!(
+        (secs - 0.1).abs() < 0.001,
+        "duration {secs} s, expected 0.1 s"
+    );
+}
+
+#[test]
+fn upload_reports_the_device_rate_to_the_backend() {
+    let bytes = make_wav_at(3_200, 32_000);
+    let mut m = null_manager();
+    m.load_sound(&bytes, "wav").expect("load failed");
+    let rate = m
+        .backend()
+        .log
+        .iter()
+        .rev()
+        .find_map(|entry| match entry {
+            BackendLog::Upload(_, _, rate) => Some(*rate),
+            _ => None,
+        })
+        .expect("an upload should be logged");
+    assert_eq!(rate, 44_100, "backend must receive device-rate audio");
+}
+
+#[test]
+fn raw_upload_at_the_device_rate_is_not_resampled() {
+    let mut m = null_manager();
+    let key = m.load_raw(Arc::new(vec![Frame::mono(0.25); 1_000]), 44_100);
+    assert_eq!(m.get_sound(key).unwrap().len_samples(), 1_000);
+}
+
+#[test]
+fn raw_upload_at_a_mismatched_rate_is_converted() {
+    let mut m = null_manager();
+    let key = m.load_raw(Arc::new(vec![Frame::mono(0.25); 1_000]), 32_000);
+    let sound = m.get_sound(key).expect("sound should be loaded");
+    assert_eq!(sound.sample_rate(), 44_100);
+    let expected = (1_000.0 * 44_100.0 / 32_000.0) as i64;
+    let len = sound.len_samples() as i64;
+    assert!(
+        (len - expected).abs() <= 1,
+        "resampled length {len}, expected ~{expected}"
+    );
+}
+
+// ── unloading ─────────────────────────────────────────────────────────────────
+
+/// Handle recorded by the most recent buffer upload.
+fn last_upload(m: &AudioManager<NullBackend>) -> BufferHandle {
+    m.backend()
+        .log
+        .iter()
+        .rev()
+        .find_map(|entry| match entry {
+            BackendLog::Upload(handle, _, _) => Some(*handle),
+            _ => None,
+        })
+        .expect("a buffer upload should be logged")
+}
+
+#[test]
+fn unload_sound_releases_the_backend_buffer() {
+    let bytes = make_wav(1_000);
+    let mut m = null_manager();
+    let key = m.load_sound(&bytes, "wav").expect("load failed");
+    let handle = m
+        .play(key, PlaybackSettings::default())
+        .expect("play failed");
+    let uploaded = last_upload(&m);
+
+    assert!(m.unload_sound(key));
+
+    assert!(m.get_sound(key).is_none(), "sound should be gone");
+    assert!(
+        m.backend().buffers.get(uploaded).is_none(),
+        "backend should drop its reference"
+    );
+    assert!(m.backend().log.contains(&BackendLog::Release(uploaded)));
+    assert!(
+        m.play(key, PlaybackSettings::default()).is_err(),
+        "reusing an unloaded key must fail"
+    );
+    // Playback started before the unload is not interrupted.
+    assert!(!m.is_finished(&handle));
+}
+
+#[test]
+fn unloading_twice_reports_the_sound_already_gone() {
+    let bytes = make_wav(100);
+    let mut m = null_manager();
+    let key = m.load_sound(&bytes, "wav").expect("load failed");
+    assert!(m.unload_sound(key));
+    assert!(!m.unload_sound(key));
+}
+
+#[test]
+fn unload_removes_sprites_registered_over_the_sound() {
+    let bytes = make_wav(1_000);
+    let mut m = null_manager();
+    let key = m.load_sound(&bytes, "wav").expect("load failed");
+    let sprite = m
+        .add_sprite(
+            key,
+            &[SpriteRegion {
+                name: "hit",
+                start: Duration::ZERO,
+                end: Duration::from_millis(20),
+                looped: false,
+            }],
+        )
+        .expect("sprite should register");
+
+    assert!(m.unload_sound(key));
+    assert!(m
+        .play_sprite(sprite, "hit", PlaybackSettings::default())
+        .is_err());
 }

@@ -229,6 +229,12 @@ impl Backend for WebAudioBackend {
         self.buffers.insert(buf)
     }
 
+    fn release_buffer(&mut self, handle: BufferHandle) {
+        // Dropping the AudioBuffer lets the browser reclaim it once the last
+        // AudioBufferSourceNode that still plays it has finished.
+        self.buffers.remove(handle);
+    }
+
     fn play(
         &mut self,
         buffer: BufferHandle,

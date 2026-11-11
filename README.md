@@ -21,7 +21,23 @@ Cross-platform game audio engine for Rust with one API for native desktop (`cpal
 | Bus DSP chain (`add_bus_effect`) | ✅ | ⚠️ |
 | Tweened volume / pan | ✅ | ✅ |
 | `NullBackend` for tests | ✅ | ✅ |
+| Source audio at any sample rate (converted on load) | ✅ | ✅ |
+| Unloading sounds to free PCM | ✅ | ✅ |
 | Native HRTF convolution | ❌ | n/a |
+
+## Sample rates and memory
+
+**Any source rate works.** Buffers are converted to the output device's sample rate when they are loaded, so a 32 kHz asset plays at the correct pitch and duration on a 48 kHz device. Conversion is a windowed-sinc (Blackman) pass done once per load — never in the audio callback — and it low-pass filters before downsampling, so content above the destination Nyquist is attenuated instead of aliasing. `SoundData::sample_rate()` reports the playback rate, which always matches `Backend::sample_rate()`. If the requested device rate is unsupported, `cpal` logs a warning naming the rate it opened instead of failing silently.
+
+**Decoded audio stays in memory until you unload it.** Everything is fully decoded to RAM (there is no streaming yet), and a ~4-minute stereo track at 44.1 kHz costs roughly 70 MB of `f32` frames. Long soundtracks should therefore be released when they are no longer needed:
+
+```rust
+// Frees the backend buffer and the manager's reference. Voices already playing
+// keep sounding; the memory goes once the last of them stops.
+manager.unload_sound(old_track);
+```
+
+Sprites registered over an unloaded sound are removed with it, and the `SoundKey` must not be reused afterwards.
 
 ## Current limitations / non-goals for v0.1
 

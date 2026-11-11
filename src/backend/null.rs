@@ -53,6 +53,8 @@ pub enum BackendLog {
     Stop,
     /// Buffer upload: `(handle, frames, sample_rate)`.
     Upload(BufferHandle, usize, u32),
+    /// Buffer released: the samples are freed once playing voices drop them.
+    Release(BufferHandle),
     /// Voice start for a buffer.
     Play(BufferHandle),
     /// Runtime parameter change: `(voice, debug_repr)`.
@@ -97,6 +99,11 @@ impl Backend for NullBackend {
         self.log
             .push(BackendLog::Upload(handle, samples.len(), rate));
         handle
+    }
+
+    fn release_buffer(&mut self, handle: BufferHandle) {
+        self.buffers.remove(handle);
+        self.log.push(BackendLog::Release(handle));
     }
 
     fn play(
